@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "220903812697",
+    "project_id": "thesisfirebase-5c3bd",
+    "storage_bucket": "thesisfirebase-5c3bd.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:220903812697:android:d1df5f68ea8ca071f9cb48",
+        "android_client_info": {
+          "package_name": "com.example.thesis_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBViIYl0LFXVB1Lim6R7TrfogJGDVsr8CM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Allows this app to make plain HTTP (not HTTPS) requests, which Android
+  blocks by default since API 28. This is needed because your local
+  Whisper server runs on plain HTTP on your laptop.
+
+  This is fine for a thesis demo on your own trusted WiFi network. Do not
+  reuse this setting this broadly in a real published app; it is only
+  acceptable here because this is a local dev and testing setup.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
