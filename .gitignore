@@ -44,3 +44,10 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 android/build/
+
+# Python / Whisper server
+whisper_server/venv/
+whisper_server/.venv/
+whisper_server/__pycache__/
+**/__pycache__/
+*.pyc
