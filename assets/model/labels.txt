@@ -1,0 +1,9 @@
+# PLACEHOLDER -- replace this file with your real trained model's label list.
+# One class label per line, in the EXACT order your model's output layer
+# uses (index 0 = first line, index 1 = second line, etc.).
+#
+# Example (delete these placeholder lines and lines starting with # once
+# you have your real trained classes):
+# Hello
+# Bye
+# Thank you

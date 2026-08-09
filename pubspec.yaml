@@ -46,6 +46,10 @@ dependencies:
   permission_handler: ^11.3.0
   video_player: ^2.8.2
   http: ^1.6.0
+  camera: ^0.12.0+2
+  hand_landmarker: ^3.0.1
+  tflite_flutter: ^0.12.1
+  flutter_tts: ^4.2.5
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -76,6 +80,7 @@ flutter:
     - images/communicating.png
     - images/WOMAN.png
     - assets/gesture_landmarks/
+    - assets/model/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
