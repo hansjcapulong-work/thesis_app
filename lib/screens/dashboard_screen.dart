@@ -6,8 +6,9 @@ import 'package:fluttertoast/fluttertoast.dart';
 import '../data/bubble_visibility.dart';
 import 'login_screen.dart';
 import 'practice_dashboard_screen.dart';
-import 'speech_to_gesture_screen.dart';
 import 'live_translation_screen.dart';
+import 'live_conversation_screen.dart';
+import 'speech_to_gesture_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({Key? key}) : super(key: key);
@@ -82,12 +83,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 60),
           GestureDetector(
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SpeechToGestureScreen())),
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => LiveConversationScreen())),
             child: _build3DCard('Start\nConversation', 'Real-time communication.', 'images/communicating.png', true),
           ),
           const SizedBox(height: 60),
           GestureDetector(
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LiveTranslationScreen())),
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SpeechToGestureScreen())),
             child: _build3DCard('Live\nTranslation', 'Sign to speech.', 'images/deafillustration.png', false),
           ),
         ]))),

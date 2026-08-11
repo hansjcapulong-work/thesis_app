@@ -14,7 +14,7 @@ import 'package:path_provider/path_provider.dart';
 /// SAME WiFi network for this to work.
 class WhisperService {
   // TODO: replace with your laptop's actual local IP address.
-  static const String serverBaseUrl = 'http://192.168.100.106:8000';
+  static const String serverBaseUrl = 'http://192.168.254.107:8000';
 
   final AudioRecorder _recorder = AudioRecorder();
   String? _currentPath;
