@@ -50,6 +50,7 @@ dependencies:
   hand_landmarker: ^3.0.1
   tflite_flutter: ^0.12.1
   flutter_tts: ^4.2.5
+  google_mlkit_pose_detection: ^0.13.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

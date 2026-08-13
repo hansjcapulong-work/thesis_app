@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'screens/introduction_screen.dart';
 import 'widgets/floating_goal_bubble.dart';
 import 'data/bubble_visibility.dart';
+import 'screens/live_conversation_screen.dart';
+import 'screens/history_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();

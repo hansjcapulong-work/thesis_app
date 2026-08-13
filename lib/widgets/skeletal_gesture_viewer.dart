@@ -54,6 +54,7 @@ class CharacterStyle {
   final Color backgroundTop;
   final Color backgroundBottom;
   final Color shadowColor;
+  final Color outlineColor;
 
   // --- Proportions (as a fraction of shoulder width, so they scale
   // naturally with however far the signer stands from the camera) ---
@@ -70,6 +71,9 @@ class CharacterStyle {
   final double shadowBlur;
   final Offset shadowOffset;
 
+  // --- Outline (border around every shape) ---
+  final double outlineWidth;
+
   const CharacterStyle({
     this.skinColor = const Color(0xFFE8B98A),
     this.shirtColor = const Color(0xFF2A1B38),
@@ -77,6 +81,7 @@ class CharacterStyle {
     this.backgroundTop = const Color(0xFFF5F5F5),
     this.backgroundBottom = const Color(0xFFE0E0E0),
     this.shadowColor = Colors.black,
+    this.outlineColor = const Color(0xFF3D2B1F),
     this.headSizeRatio = 0.42,
     this.upperArmThicknessRatio = 0.13,
     this.forearmThicknessRatio = 0.10,
@@ -87,6 +92,7 @@ class CharacterStyle {
     this.palmOpacity = 0.95,
     this.shadowBlur = 4.0,
     this.shadowOffset = const Offset(2, 4),
+    this.outlineWidth = 2.0,
   });
 
   /// A couple of ready-made alternate looks -- pass one of these to
@@ -98,12 +104,14 @@ class CharacterStyle {
     shirtColor: Color(0xFF1B3A4B),
     backgroundTop: Color(0xFFEFF5F7),
     backgroundBottom: Color(0xFFDCE8EC),
+    outlineColor: Color(0xFF14232B),
   );
 
   static const CharacterStyle highContrast = CharacterStyle(
     skinColor: Color(0xFFFFFFFF),
     shirtColor: Color(0xFF000000),
     eyeColor: Colors.black,
+    outlineColor: Colors.black,
     backgroundTop: Color(0xFFFAFAFA),
     backgroundBottom: Color(0xFFFAFAFA),
   );
@@ -137,21 +145,33 @@ class SkeletalGestureData {
 }
 
 /// Animates a recorded hand + pose landmark sequence as a simple 2D
-/// vector character. Pass [style] to customize colors and proportions
-/// -- see CharacterStyle above for every available option.
+/// vector character. Pass [style] to customize colors and proportions.
+///
+/// [assetPath] may be null for words that don't have a recorded gesture
+/// yet -- in that case, instead of disappearing, the character freezes
+/// on whatever frame was already showing, waits briefly, then calls
+/// [onFinished] so a sequence can continue past the gap without an
+/// abrupt cut or losing its transition-blend state.
+///
+/// [sequenceKey] should change every time you move to a new word in a
+/// sequence, even if the new word's assetPath is also null (e.g. two
+/// missing-gesture words in a row) -- it's how the widget detects "this
+/// is a new word" independent of whether assetPath actually changed.
 ///
 /// IMPORTANT: do NOT give this widget a new Key() per word. Keep the
 /// same widget instance across a matched-word sequence (only change
-/// assetPath) so it can smoothly blend from the end of one word into
-/// the start of the next, instead of snapping.
+/// assetPath/sequenceKey) so it can smoothly blend from the end of one
+/// word into the start of the next, instead of snapping.
 class SkeletalGestureViewer extends StatefulWidget {
-  final String assetPath;
+  final String? assetPath;
+  final Object sequenceKey;
   final VoidCallback? onFinished;
   final CharacterStyle style;
 
   const SkeletalGestureViewer({
     Key? key,
     required this.assetPath,
+    this.sequenceKey = 0,
     this.onFinished,
     this.style = CharacterStyle.warm,
   }) : super(key: key);
@@ -162,6 +182,7 @@ class SkeletalGestureViewer extends StatefulWidget {
 
 class _SkeletalGestureViewerState extends State<SkeletalGestureViewer> {
   static const int _transitionFrameCount = 8;
+  static const Duration _holdDuration = Duration(milliseconds: 900);
 
   List<GestureFrame> _playbackFrames = [];
   int _frameIndex = 0;
@@ -173,15 +194,37 @@ class _SkeletalGestureViewerState extends State<SkeletalGestureViewer> {
   @override
   void initState() {
     super.initState();
-    _load();
+    if (widget.assetPath == null) {
+      _holdCurrentFrame();
+    } else {
+      _load();
+    }
   }
 
   @override
   void didUpdateWidget(covariant SkeletalGestureViewer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.assetPath != widget.assetPath) {
-      _load();
+    if (oldWidget.sequenceKey != widget.sequenceKey) {
+      if (widget.assetPath == null) {
+        _holdCurrentFrame();
+      } else {
+        _load();
+      }
     }
+  }
+
+  /// Used for words that don't have a recorded landmark asset yet.
+  /// Rather than clearing the display (which would destroy the
+  /// transition-blend state and cause an abrupt cut), this freezes on
+  /// whatever frame is already showing, waits briefly, then signals
+  /// completion so the sequence can continue to the next word.
+  void _holdCurrentFrame() {
+    _timer?.cancel();
+    setState(() => _error = null);
+    _timer = Timer(_holdDuration, () {
+      if (!mounted) return;
+      widget.onFinished?.call();
+    });
   }
 
   Future<void> _load() async {
@@ -190,7 +233,7 @@ class _SkeletalGestureViewerState extends State<SkeletalGestureViewer> {
     setState(() => _error = null);
 
     try {
-      final data = await SkeletalGestureData.loadFromAsset(widget.assetPath);
+      final data = await SkeletalGestureData.loadFromAsset(widget.assetPath!);
       if (!mounted) return;
 
       final newFrames = data.frames;
@@ -277,6 +320,20 @@ class _SkeletalGestureViewerState extends State<SkeletalGestureViewer> {
     }
 
     if (_playbackFrames.isEmpty) {
+      if (widget.assetPath == null) {
+        return Container(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [widget.style.backgroundTop, widget.style.backgroundBottom],
+            ),
+          ),
+          child: const Center(
+            child: Icon(Icons.accessibility_new, size: 64, color: Colors.grey),
+          ),
+        );
+      }
       return const Center(child: CircularProgressIndicator());
     }
 
@@ -306,6 +363,24 @@ class _CharacterPainter extends CustomPainter {
   _CharacterPainter({required this.frame, required this.style});
 
   Offset _scale(Offset p, Size size) => Offset(p.dx * size.width, p.dy * size.height);
+
+  /// Draws a filled capsule twice -- a slightly larger one in the
+  /// outline color first, then the real size on top -- for a clean
+  /// consistent border around every limb segment.
+  void _drawCapsuleOutlined(
+      Canvas canvas,
+      Offset start,
+      Offset end,
+      double startRadius,
+      double endRadius,
+      Color fillColor,
+      ) {
+    final outlinePaint = Paint()..color = style.outlineColor..style = PaintingStyle.fill;
+    _drawCapsule(canvas, start, end, startRadius + style.outlineWidth, endRadius + style.outlineWidth, outlinePaint);
+
+    final fillPaint = Paint()..color = fillColor..style = PaintingStyle.fill;
+    _drawCapsule(canvas, start, end, startRadius, endRadius, fillPaint);
+  }
 
   void _drawCapsule(
       Canvas canvas,
@@ -356,20 +431,49 @@ class _CharacterPainter extends CustomPainter {
       ..close();
 
     canvas.drawPath(path, Paint()..color = style.shirtColor..style = PaintingStyle.fill);
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = style.outlineColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = style.outlineWidth
+        ..strokeJoin = StrokeJoin.round,
+    );
   }
 
-  void _drawArms(Canvas canvas, List<Offset> pose) {
+  /// Draws both arms, connecting the forearm directly to the HAND
+  /// model's own wrist point whenever that hand's landmarks are
+  /// available for this frame -- rather than the pose model's separate
+  /// wrist estimate -- so the arm and hand always connect with no gap.
+  void _drawArms(
+      Canvas canvas,
+      List<Offset> pose,
+      List<Offset>? leftHandScaled,
+      List<Offset>? rightHandScaled,
+      ) {
     if (pose.length <= _poseRightWrist) return;
     final shoulderWidth = (pose[_poseRightShoulder] - pose[_poseLeftShoulder]).distance;
     final upperRadius = shoulderWidth * style.upperArmThicknessRatio;
     final lowerRadius = shoulderWidth * style.forearmThicknessRatio;
-    final paint = Paint()..color = style.skinColor..style = PaintingStyle.fill;
 
-    _drawCapsule(canvas, pose[_poseLeftShoulder], pose[_poseLeftElbow], upperRadius, lowerRadius, paint);
-    _drawCapsule(canvas, pose[_poseLeftElbow], pose[_poseLeftWrist], lowerRadius, lowerRadius * 0.8, paint);
+    final leftWrist = (leftHandScaled != null && leftHandScaled.isNotEmpty)
+        ? leftHandScaled[0]
+        : pose[_poseLeftWrist];
+    final rightWrist = (rightHandScaled != null && rightHandScaled.isNotEmpty)
+        ? rightHandScaled[0]
+        : pose[_poseRightWrist];
 
-    _drawCapsule(canvas, pose[_poseRightShoulder], pose[_poseRightElbow], upperRadius, lowerRadius, paint);
-    _drawCapsule(canvas, pose[_poseRightElbow], pose[_poseRightWrist], lowerRadius, lowerRadius * 0.8, paint);
+    _drawCapsuleOutlined(canvas, pose[_poseLeftShoulder], pose[_poseLeftElbow], upperRadius, lowerRadius, style.skinColor);
+    _drawCapsuleOutlined(canvas, pose[_poseLeftElbow], leftWrist, lowerRadius, lowerRadius * 0.85, style.skinColor);
+
+    _drawCapsuleOutlined(canvas, pose[_poseRightShoulder], pose[_poseRightElbow], upperRadius, lowerRadius, style.skinColor);
+    _drawCapsuleOutlined(canvas, pose[_poseRightElbow], rightWrist, lowerRadius, lowerRadius * 0.85, style.skinColor);
+
+    final wristJointRadius = lowerRadius * 0.9;
+    for (final wrist in [leftWrist, rightWrist]) {
+      canvas.drawCircle(wrist, wristJointRadius + style.outlineWidth, Paint()..color = style.outlineColor);
+      canvas.drawCircle(wrist, wristJointRadius, Paint()..color = style.skinColor);
+    }
   }
 
   void _drawHead(Canvas canvas, List<Offset> pose) {
@@ -379,7 +483,8 @@ class _CharacterPainter extends CustomPainter {
     final headRadius = shoulderWidth * style.headSizeRatio;
     final headCenter = Offset(nose.dx, nose.dy - headRadius * 0.25);
 
-    canvas.drawCircle(headCenter, headRadius, Paint()..color = style.skinColor..style = PaintingStyle.fill);
+    canvas.drawCircle(headCenter, headRadius + style.outlineWidth, Paint()..color = style.outlineColor);
+    canvas.drawCircle(headCenter, headRadius, Paint()..color = style.skinColor);
 
     final eyeOffsetX = headRadius * style.eyeSpacingRatio;
     final eyePaint = Paint()..color = style.eyeColor;
@@ -387,20 +492,18 @@ class _CharacterPainter extends CustomPainter {
     canvas.drawCircle(headCenter + Offset(eyeOffsetX, 0), headRadius * style.eyeSizeRatio, eyePaint);
   }
 
-  void _drawHand(Canvas canvas, Size size, List<Offset>? points) {
-    if (points == null || points.length < 21) return;
+  void _drawHand(Canvas canvas, List<Offset>? scaledPoints) {
+    if (scaledPoints == null || scaledPoints.length < 21) return;
 
-    final scaled = points.map((p) => _scale(p, size)).toList();
+    _drawPalm(canvas, scaledPoints, style.shadowOffset, isShadow: true);
+    _drawFingers(canvas, scaledPoints, style.shadowOffset, isShadow: true);
 
-    _drawPalm(canvas, scaled, style.shadowOffset, isShadow: true);
-    _drawFingers(canvas, scaled, style.shadowOffset, isShadow: true);
+    _drawPalm(canvas, scaledPoints, Offset.zero, isShadow: false);
+    _drawFingers(canvas, scaledPoints, Offset.zero, isShadow: false);
 
-    _drawPalm(canvas, scaled, Offset.zero, isShadow: false);
-    _drawFingers(canvas, scaled, Offset.zero, isShadow: false);
-
-    final jointPaint = Paint()..color = style.skinColor.withOpacity(0.9);
     for (final i in const [0, 5, 9, 13, 17]) {
-      canvas.drawCircle(scaled[i], 4, jointPaint);
+      canvas.drawCircle(scaledPoints[i], 4 + style.outlineWidth * 0.5, Paint()..color = style.outlineColor);
+      canvas.drawCircle(scaledPoints[i], 4, Paint()..color = style.skinColor.withOpacity(0.9));
     }
   }
 
@@ -417,14 +520,24 @@ class _CharacterPainter extends CustomPainter {
     }
     path.close();
 
-    final paint = Paint()..style = PaintingStyle.fill;
     if (isShadow) {
-      paint.color = style.shadowColor.withOpacity(0.18);
-      paint.maskFilter = MaskFilter.blur(BlurStyle.normal, style.shadowBlur);
-    } else {
-      paint.color = style.skinColor.withOpacity(style.palmOpacity);
+      final shadowPaint = Paint()
+        ..style = PaintingStyle.fill
+        ..color = style.shadowColor.withOpacity(0.18)
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, style.shadowBlur);
+      canvas.drawPath(path, shadowPaint);
+      return;
     }
-    canvas.drawPath(path, paint);
+
+    canvas.drawPath(path, Paint()..style = PaintingStyle.fill..color = style.skinColor.withOpacity(style.palmOpacity));
+    canvas.drawPath(
+      path,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..color = style.outlineColor
+        ..strokeWidth = style.outlineWidth
+        ..strokeJoin = StrokeJoin.round,
+    );
   }
 
   void _drawFingers(Canvas canvas, List<Offset> pts, Offset offset, {required bool isShadow}) {
@@ -446,35 +559,49 @@ class _CharacterPainter extends CustomPainter {
         final a = pts[finger[i]] + offset;
         final b = pts[finger[i + 1]] + offset;
 
-        final paint = Paint()
-          ..strokeWidth = widths[i]
-          ..strokeCap = StrokeCap.round
-          ..style = PaintingStyle.stroke;
-
         if (isShadow) {
-          paint.color = style.shadowColor.withOpacity(0.16);
-          paint.maskFilter = MaskFilter.blur(BlurStyle.normal, style.shadowBlur);
-        } else {
-          paint.color = style.skinColor.withOpacity(style.palmOpacity + 0.03);
+          final paint = Paint()
+            ..strokeWidth = widths[i]
+            ..strokeCap = StrokeCap.round
+            ..style = PaintingStyle.stroke
+            ..color = style.shadowColor.withOpacity(0.16)
+            ..maskFilter = MaskFilter.blur(BlurStyle.normal, style.shadowBlur);
+          canvas.drawLine(a, b, paint);
+          continue;
         }
 
-        canvas.drawLine(a, b, paint);
+        final outlinePaint = Paint()
+          ..strokeWidth = widths[i] + style.outlineWidth * 2
+          ..strokeCap = StrokeCap.round
+          ..style = PaintingStyle.stroke
+          ..color = style.outlineColor;
+        canvas.drawLine(a, b, outlinePaint);
+
+        final fillPaint = Paint()
+          ..strokeWidth = widths[i]
+          ..strokeCap = StrokeCap.round
+          ..style = PaintingStyle.stroke
+          ..color = style.skinColor.withOpacity(style.palmOpacity + 0.03);
+        canvas.drawLine(a, b, fillPaint);
       }
     }
   }
 
   @override
   void paint(Canvas canvas, Size size) {
+    final leftHandScaled = frame.left?.map((p) => _scale(p, size)).toList();
+    final rightHandScaled = frame.right?.map((p) => _scale(p, size)).toList();
+
     final posePoints = frame.pose;
     if (posePoints != null && posePoints.length > _poseRightHip) {
       final pose = posePoints.map((p) => _scale(p, size)).toList();
       _drawTorso(canvas, pose);
-      _drawArms(canvas, pose);
+      _drawArms(canvas, pose, leftHandScaled, rightHandScaled);
       _drawHead(canvas, pose);
     }
 
-    _drawHand(canvas, size, frame.left);
-    _drawHand(canvas, size, frame.right);
+    _drawHand(canvas, leftHandScaled);
+    _drawHand(canvas, rightHandScaled);
   }
 
   @override

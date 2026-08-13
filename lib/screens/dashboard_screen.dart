@@ -4,11 +4,15 @@ import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import '../data/bubble_visibility.dart';
+import '../widgets/app_bottom_nav.dart';
 import 'login_screen.dart';
 import 'practice_dashboard_screen.dart';
-import 'live_translation_screen.dart';
 import 'live_conversation_screen.dart';
 import 'speech_to_gesture_screen.dart';
+import 'history_screen.dart';
+import 'progress_screen.dart';
+import 'notifications_screen.dart';
+import 'settings_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({Key? key}) : super(key: key);
@@ -23,6 +27,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
 
   Future<void> _logout(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Log out?'),
+        content: const Text('You will need to sign in again to continue.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Log Out', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    if (!context.mounted) return;
+
     bubbleVisible.value = false;
     await FirebaseAuth.instance.signOut();
     if (!context.mounted) return;
@@ -88,10 +112,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 60),
           GestureDetector(
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SpeechToGestureScreen())),
-            child: _build3DCard('Live\nTranslation', 'Sign to speech.', 'images/deafillustration.png', false),
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryScreen())),
+            child: _build3DCardIcon('History', 'Past conversations.', Icons.history_rounded, true),
           ),
         ]))),
+
       ),
     );
   }
@@ -101,6 +126,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
       Positioned(top: 15, left: -12, right: 12, bottom: -12, child: Container(decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)))),
       Container(width: double.infinity, decoration: BoxDecoration(color: const Color(0xFF2A1B38), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)), padding: EdgeInsets.only(left: isRight ? 24 : 140, right: isRight ? 140 : 24, top: 25), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)), Text(sub, style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 11))])),
       Positioned(left: isRight ? null : -25, right: isRight ? -25 : null, top: -35, bottom: -5, child: Image.asset(img)),
+    ]));
+  }
+
+  /// Same card treatment as [_build3DCard], but for destinations that don't
+  /// have a dedicated illustration asset yet -- uses a large Icon instead.
+  Widget _build3DCardIcon(String title, String sub, IconData icon, bool isRight) {
+    return SizedBox(height: 150, child: Stack(clipBehavior: Clip.none, children: [
+      Positioned(top: 15, left: -12, right: 12, bottom: -12, child: Container(decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)))),
+      Container(width: double.infinity, decoration: BoxDecoration(color: const Color(0xFF2A1B38), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)), padding: EdgeInsets.only(left: isRight ? 24 : 140, right: isRight ? 140 : 24, top: 25), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)), Text(sub, style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 11))])),
+      Positioned(left: isRight ? null : -25, right: isRight ? -25 : null, top: -35, bottom: -5, child: Center(child: Icon(icon, size: 90, color: Colors.white.withOpacity(0.85)))),
     ]));
   }
 }

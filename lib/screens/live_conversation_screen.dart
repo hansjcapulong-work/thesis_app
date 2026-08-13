@@ -1,12 +1,22 @@
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:hand_landmarker/hand_landmarker.dart';
 import '../data/asl_words.dart';
-import '../services/gesture_recognition_service.dart';
 import '../services/gloss_matcher.dart';
 import '../services/tts_service.dart';
 import '../services/whisper_service.dart';
+import '../services/conversation_history_service.dart';
 import '../widgets/skeletal_gesture_viewer.dart';
+
+// ===========================================================================
+// TEST MODE: the camera + hand/pose recognition pipeline is temporarily
+// swapped for a manual text box, so the "Transcribe Conversation" chat
+// history UI can be tested without a working trained model.
+//
+// To restore the real camera pipeline later: bring back the `camera` and
+// `hand_landmarker` imports, the GestureRecognitionService, and the
+// _buildSigningPanel() camera/viewfinder implementation from the previous
+// version of this file. Everything else (mic, 3D ASL box, chat transcript,
+// mute toggle) is untouched and still fully functional.
+// ===========================================================================
 
 const _purple = Color(0xFF2A1B38);
 
@@ -15,14 +25,10 @@ enum _EntrySource { signed, spoken }
 class _ConversationEntry {
   final _EntrySource source;
   final String text;
-  _ConversationEntry(this.source, this.text);
+  final DateTime timestamp;
+  _ConversationEntry(this.source, this.text) : timestamp = DateTime.now();
 }
 
-/// Two-way live conversation screen: camera + viewfinder at the top
-/// (Deaf person signs, recognized words are spoken aloud), a bordered
-/// "3D ASL" box in the middle showing the animated sign for whatever
-/// was just spoken, and a scrollable dark chat transcript at the
-/// bottom logging both directions of the conversation.
 class LiveConversationScreen extends StatefulWidget {
   const LiveConversationScreen({Key? key}) : super(key: key);
 
@@ -31,19 +37,14 @@ class LiveConversationScreen extends StatefulWidget {
 }
 
 class _LiveConversationScreenState extends State<LiveConversationScreen> {
-  // --- Gesture-to-speech side (camera) ---
-  CameraController? _controller;
-  HandLandmarkerPlugin? _plugin;
-  final GestureRecognitionService _gestureService = GestureRecognitionService();
-  bool _cameraInitialized = false;
-  String? _cameraInitError;
-  bool _modelLoaded = false;
-  int _handsVisible = 0;
-
-  // --- Speech-to-gesture side (mic) ---
-  final WhisperService _whisperService = WhisperService();
+  // --- TEST MODE: manual text entry stands in for camera recognition ---
+  final TextEditingController _signedInputController = TextEditingController();
   final TtsService _tts = TtsService();
+
+  // --- Speech-to-gesture side (mic) -- unchanged, still real ---
+  final WhisperService _whisperService = WhisperService();
   bool _isRecording = false;
+  bool _isTranscribing = false; // true while waiting on the server after Stop is tapped
   List<ASLWord> _matchedWords = [];
   int _currentWordIndex = 0;
 
@@ -51,6 +52,17 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
   final List<_ConversationEntry> _conversation = [];
   final ScrollController _chatScrollController = ScrollController();
   bool _isMuted = false;
+
+  // --- Persisted history: when this visit to the screen started ---
+  final DateTime _sessionStartedAt = DateTime.now();
+
+  // --- Draggable panel sizing ---
+  // Height (in px) of the "Transcribe Conversation" panel. Null until the
+  // first layout pass, at which point we seed it from the available height.
+  double? _transcribeHeight;
+  static const double _gap = 16.0;
+  static const double _minTranscribeHeight = 160.0;
+  static const double _minTopHeight = 160.0; // min combined height for input+ASL box
 
   ASLWord? get _currentWord =>
       _matchedWords.isNotEmpty && _currentWordIndex < _matchedWords.length
@@ -60,17 +72,7 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
   @override
   void initState() {
     super.initState();
-    _gestureService.onModelStatusChanged = (isLoaded, message) {
-      if (!mounted) return;
-      setState(() => _modelLoaded = isLoaded);
-    };
-    _gestureService.onGestureRecognized = (word, confidence) {
-      if (!mounted) return;
-      _appendEntry(_EntrySource.signed, word);
-      if (!_isMuted) _tts.speak(word);
-    };
     _tts.init();
-    _initCamera();
   }
 
   void _appendEntry(_EntrySource source, String text) {
@@ -85,69 +87,32 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
     });
   }
 
-  // ─────────────────────────── Camera / gesture-to-speech ───────────────────────────
-
-  Future<void> _initCamera() async {
-    try {
-      await _gestureService.loadModel();
-
-      final cameras = await availableCameras();
-      final camera = cameras.firstWhere(
-        (cam) => cam.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
-      );
-
-      _controller = CameraController(camera, ResolutionPreset.medium, enableAudio: false);
-
-      _plugin = HandLandmarkerPlugin.create(
-        numHands: 2,
-        minHandDetectionConfidence: 0.6,
-        delegate: HandLandmarkerDelegate.gpu,
-      );
-
-      await _controller!.initialize();
-      await _controller!.startImageStream(_processCameraImage);
-      _plugin!.landmarkStream.listen(_onHandsDetected);
-
-      if (!mounted) return;
-      setState(() => _cameraInitialized = true);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _cameraInitError = 'Camera setup failed: $e');
-    }
-  }
-
-  void _processCameraImage(CameraImage image) {
-    if (_plugin == null || _controller == null) return;
-    try {
-      _plugin!.processFrame(image, _controller!.description.sensorOrientation);
-    } catch (e) {
-      debugPrint('Error processing camera frame: $e');
-    }
-  }
-
-  /// NOTE: position-based left/right fallback -- see earlier flag about
-  /// this plugin's handedness labeling. Swap if hands seem mislabeled.
-  void _onHandsDetected(List<Hand> hands) {
-    if (!mounted) return;
-    setState(() => _handsVisible = hands.length);
-
-    List<List<double>>? leftLandmarks;
-    List<List<double>>? rightLandmarks;
-
-    if (hands.length == 1) {
-      leftLandmarks = hands.first.landmarks.map((l) => [l.x, l.y, 0.0]).toList();
-    } else if (hands.length >= 2) {
-      final sorted = List<Hand>.from(hands)
-        ..sort((a, b) => a.landmarks[0].x.compareTo(b.landmarks[0].x));
-      leftLandmarks = sorted[0].landmarks.map((l) => [l.x, l.y, 0.0]).toList();
-      rightLandmarks = sorted[1].landmarks.map((l) => [l.x, l.y, 0.0]).toList();
-    }
-
-    _gestureService.addFrame(
-      leftHandLandmarks: leftLandmarks,
-      rightHandLandmarks: rightLandmarks,
+  /// Persists everything exchanged during this visit to the screen. Fires
+  /// once, when the screen is closed. Silently no-ops if the conversation
+  /// was empty or nobody is signed in.
+  void _saveConversationIfNeeded() {
+    if (_conversation.isEmpty) return;
+    ConversationHistoryService.saveSession(
+      startedAt: _sessionStartedAt,
+      entries: _conversation
+          .map((e) => ConversationEntryData(
+        source: e.source == _EntrySource.signed ? 'signed' : 'spoken',
+        text: e.text,
+        timestamp: e.timestamp,
+      ))
+          .toList(),
     );
+  }
+
+  // ─────────────────────────── TEST MODE: manual "signed" input ───────────────────────────
+
+  void _submitSignedText() {
+    final text = _signedInputController.text.trim();
+    if (text.isEmpty) return;
+
+    _appendEntry(_EntrySource.signed, text);
+    if (!_isMuted) _tts.speak(text);
+    _signedInputController.clear();
   }
 
   // ─────────────────────────── Mic / speech-to-gesture ───────────────────────────
@@ -167,20 +132,31 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
 
     try {
       await _whisperService.startRecording();
-      await Future.delayed(const Duration(seconds: 4));
+    } catch (e) {
+      setState(() => _isRecording = false);
+      _appendEntry(_EntrySource.spoken, 'Could not start recording: $e');
+    }
+  }
 
+  void _stopListening() async {
+    setState(() {
+      _isRecording = false;
+      _isTranscribing = true;
+    });
+
+    try {
       final text = await _whisperService.stopAndTranscribe();
       final matches = GlossMatcher.matchTranscript(text);
 
       setState(() {
         _matchedWords = matches;
-        _isRecording = false;
+        _isTranscribing = false;
         _currentWordIndex = 0;
       });
 
       _appendEntry(_EntrySource.spoken, text.isEmpty ? 'No speech detected.' : text);
     } catch (e) {
-      setState(() => _isRecording = false);
+      setState(() => _isTranscribing = false);
       _appendEntry(_EntrySource.spoken, 'Transcription failed: $e');
     }
   }
@@ -202,70 +178,114 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
         elevation: 0,
         iconTheme: const IconThemeData(color: _purple),
         title: const Text(
-          'Live Conversation',
-          style: TextStyle(color: _purple, fontWeight: FontWeight.bold, fontSize: 18),
+          'Live Conversation (TEST MODE)',
+          style: TextStyle(color: _purple, fontWeight: FontWeight.bold, fontSize: 16),
         ),
       ),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              Expanded(flex: 4, child: _buildCameraViewfinder()),
-              const SizedBox(height: 16),
-              Expanded(flex: 3, child: _buildAslBox()),
-              const SizedBox(height: 16),
-              Expanded(flex: 4, child: _buildTranscribePanel()),
-            ],
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final totalHeight = constraints.maxHeight;
+
+              // Seed the transcribe panel height on first layout (roughly
+              // the same 4/11 ratio the old flex:4 gave it).
+              _transcribeHeight ??= (totalHeight * 4 / 11).clamp(
+                _minTranscribeHeight,
+                totalHeight - _minTopHeight - _gap * 2,
+              );
+
+              final maxTranscribeHeight =
+              (totalHeight - _minTopHeight - _gap * 2).clamp(_minTranscribeHeight, double.infinity);
+              final transcribeHeight =
+              _transcribeHeight!.clamp(_minTranscribeHeight, maxTranscribeHeight);
+
+              final topHeight = totalHeight - transcribeHeight - _gap * 2;
+              // Preserve the original 4:3 ratio between the input box and the ASL box.
+              final signedHeight = topHeight * 4 / 7;
+              final aslHeight = topHeight * 3 / 7;
+
+              return Column(
+                children: [
+                  SizedBox(height: signedHeight, child: _buildSignedTextInputPanel()),
+                  const SizedBox(height: _gap),
+                  SizedBox(height: aslHeight, child: _buildAslBox()),
+                  const SizedBox(height: _gap),
+                  SizedBox(
+                    height: transcribeHeight,
+                    child: _buildTranscribePanel(totalHeight, maxTranscribeHeight),
+                  ),
+                ],
+              );
+            },
           ),
         ),
       ),
     );
   }
 
-  /// Camera preview with corner-bracket viewfinder framing.
-  Widget _buildCameraViewfinder() {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(16),
-      child: Container(
-        color: Colors.grey.shade200,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            if (_cameraInitError != null)
-              Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(_cameraInitError!, style: const TextStyle(color: Colors.red), textAlign: TextAlign.center),
-                ),
-              )
-            else if (!_cameraInitialized)
-              const Center(child: CircularProgressIndicator(color: _purple))
-            else
-              CameraPreview(_controller!),
-
-            // Corner bracket overlay.
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: _ViewfinderCorners(),
+  /// TEST MODE stand-in for the camera viewfinder: a text box + send
+  /// button that appends into the "signed" side of the conversation,
+  /// exactly like real gesture recognition would.
+  Widget _buildSignedTextInputPanel() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.grey.shade300),
+      ),
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.science_outlined, size: 16, color: Colors.orange),
+              const SizedBox(width: 6),
+              const Text(
+                'Test input (stands in for camera recognition)',
+                style: TextStyle(fontSize: 11, color: Colors.orange, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Expanded(
+            child: TextField(
+              controller: _signedInputController,
+              maxLines: null,
+              expands: true,
+              textAlignVertical: TextAlignVertical.top,
+              decoration: InputDecoration(
+                hintText: 'Type what would have been signed...',
+                filled: true,
+                fillColor: Colors.white,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                contentPadding: const EdgeInsets.all(12),
+              ),
+              onSubmitted: (_) => _submitSignedText(),
             ),
-
-            Positioned(
-              top: 10,
-              right: 14,
-              child: Text(
-                'Hands: $_handsVisible',
-                style: const TextStyle(color: Colors.black54, fontSize: 11, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerRight,
+            child: ElevatedButton.icon(
+              onPressed: _submitSignedText,
+              icon: const Icon(Icons.send, size: 16),
+              label: const Text('Add as Signed'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _purple,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
 
-  /// Bordered box showing the animated sign for whatever was last
-  /// spoken -- "3D ASL" label when idle.
   Widget _buildAslBox() {
     return Container(
       decoration: BoxDecoration(
@@ -277,23 +297,21 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
         borderRadius: BorderRadius.circular(14),
         child: _matchedWords.isEmpty
             ? const Center(
-                child: Text(
-                  '3D ASL',
-                  style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 1),
-                ),
-              )
+          child: Text(
+            '3D ASL',
+            style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 1),
+          ),
+        )
             : SkeletalGestureViewer(
-                assetPath: _currentWord?.landmarksAsset,
-                sequenceKey: _currentWordIndex,
-                onFinished: _advanceToNextWord,
-              ),
+          assetPath: _currentWord?.landmarksAsset,
+          sequenceKey: _currentWordIndex,
+          onFinished: _advanceToNextWord,
+        ),
       ),
     );
   }
 
-  /// Dark scrollable chat-style transcript of the full conversation,
-  /// plus the mic control.
-  Widget _buildTranscribePanel() {
+  Widget _buildTranscribePanel(double totalHeight, double maxTranscribeHeight) {
     return Container(
       decoration: const BoxDecoration(
         color: _purple,
@@ -302,13 +320,29 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
       child: Column(
         children: [
           const SizedBox(height: 8),
-          Container(
-            width: 40,
-            height: 4,
-            decoration: BoxDecoration(color: Colors.white38, borderRadius: BorderRadius.circular(2)),
+          // Drag handle: vertical drag resizes the panel.
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onVerticalDragUpdate: (details) {
+              setState(() {
+                // Dragging up (negative dy) should grow the panel, so subtract dy.
+                final next = (_transcribeHeight ?? maxTranscribeHeight) - details.delta.dy;
+                _transcribeHeight = next.clamp(_minTranscribeHeight, maxTranscribeHeight);
+              });
+            },
+            child: Container(
+              // Slightly bigger tap/drag target than the visible bar.
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              color: Colors.transparent,
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(color: Colors.white38, borderRadius: BorderRadius.circular(2)),
+              ),
+            ),
           ),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 10, 8, 4),
+            padding: const EdgeInsets.fromLTRB(16, 6, 8, 4),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -327,30 +361,42 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
           Expanded(
             child: _conversation.isEmpty
                 ? const Center(
-                    child: Text('No conversation yet.', style: TextStyle(color: Colors.white38, fontSize: 13)),
-                  )
+              child: Text('No conversation yet.', style: TextStyle(color: Colors.white38, fontSize: 13)),
+            )
                 : ListView.builder(
-                    controller: _chatScrollController,
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    itemCount: _conversation.length,
-                    itemBuilder: (context, index) => _buildChatBubble(_conversation[index]),
-                  ),
+              controller: _chatScrollController,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              itemCount: _conversation.length,
+              itemBuilder: (context, index) => _buildChatBubble(_conversation[index]),
+            ),
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-            child: _isRecording
+            child: _isTranscribing
                 ? const CircularProgressIndicator(color: Colors.white)
+                : _isRecording
+                ? ElevatedButton.icon(
+              onPressed: _stopListening,
+              icon: const Icon(Icons.stop),
+              label: const Text('Stop'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red.shade400,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+              ),
+            )
                 : ElevatedButton.icon(
-                    onPressed: _startListening,
-                    icon: const Icon(Icons.mic),
-                    label: const Text('Start Speaking'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.white,
-                      foregroundColor: _purple,
-                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-                    ),
-                  ),
+              onPressed: _startListening,
+              icon: const Icon(Icons.mic),
+              label: const Text('Start Speaking'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.white,
+                foregroundColor: _purple,
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+              ),
+            ),
           ),
         ],
       ),
@@ -397,65 +443,10 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
 
   @override
   void dispose() {
+    _saveConversationIfNeeded();
+    _signedInputController.dispose();
     _chatScrollController.dispose();
-    _controller?.stopImageStream();
-    _controller?.dispose();
-    _plugin?.dispose();
-    _gestureService.dispose();
     _tts.dispose();
     super.dispose();
-  }
-}
-
-/// Four L-shaped corner brackets forming a viewfinder frame, matching
-/// the design mockup.
-class _ViewfinderCorners extends StatelessWidget {
-  const _ViewfinderCorners();
-
-  @override
-  Widget build(BuildContext context) {
-    const thickness = 3.0;
-    const length = 28.0;
-    const color = Colors.black87;
-
-    Widget corner({required bool top, required bool left}) {
-      return Positioned(
-        top: top ? 0 : null,
-        bottom: top ? null : 0,
-        left: left ? 0 : null,
-        right: left ? null : 0,
-        child: SizedBox(
-          width: length,
-          height: length,
-          child: Stack(
-            children: [
-              Positioned(
-                top: top ? 0 : null,
-                bottom: top ? null : 0,
-                left: 0,
-                right: 0,
-                child: Container(height: thickness, color: color),
-              ),
-              Positioned(
-                left: left ? 0 : null,
-                right: left ? null : 0,
-                top: 0,
-                bottom: 0,
-                child: Container(width: thickness, color: color),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    return Stack(
-      children: [
-        corner(top: true, left: true),
-        corner(top: true, left: false),
-        corner(top: false, left: true),
-        corner(top: false, left: false),
-      ],
-    );
   }
 }
