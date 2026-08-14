@@ -3,19 +3,15 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:path_provider/path_provider.dart';
+import 'server_config.dart';
 
 /// Handles microphone recording and sends the audio to a locally-hosted
 /// Whisper server running on your laptop (see whisper_server/server.py).
 ///
-/// IMPORTANT: update [serverBaseUrl] below to match your laptop's local
-/// IP address. Find it by running `ipconfig` on your laptop and looking
-/// for the "IPv4 Address" under your active WiFi adapter (usually looks
-/// like 192.168.x.x). Your phone and laptop must be connected to the
-/// SAME WiFi network for this to work.
+/// Server address now lives in [ServerConfig.baseUrl] (server_config.dart)
+/// -- it's shared with GestureRecognitionService since both hit the same
+/// laptop server. Update the IP there, not here.
 class WhisperService {
-  // TODO: replace with your laptop's actual local IP address.
-  static const String serverBaseUrl = 'http://192.168.254.139:8000';
-
   final AudioRecorder _recorder = AudioRecorder();
   String? _currentPath;
 
@@ -24,7 +20,7 @@ class WhisperService {
   Future<void> startRecording() async {
     final dir = await getTemporaryDirectory();
     _currentPath =
-        '${dir.path}/speech_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    '${dir.path}/speech_${DateTime.now().millisecondsSinceEpoch}.m4a';
     await _recorder.start(
       const RecordConfig(encoder: AudioEncoder.aacLc),
       path: _currentPath!,
@@ -44,20 +40,20 @@ class WhisperService {
 
     final request = http.MultipartRequest(
       'POST',
-      Uri.parse('$serverBaseUrl/transcribe'),
+      Uri.parse('${ServerConfig.baseUrl}/transcribe'),
     );
     request.files.add(await http.MultipartFile.fromPath('file', file.path));
 
     final http.StreamedResponse streamedResponse;
     try {
       streamedResponse = await request.send().timeout(
-            const Duration(seconds: 30),
-          );
+        const Duration(seconds: 30),
+      );
     } catch (e) {
       throw Exception(
-        'Could not reach the Whisper server at $serverBaseUrl. '
-        'Make sure server.py is running and your phone is on the same '
-        'WiFi network as your laptop. ($e)',
+        'Could not reach the server at ${ServerConfig.baseUrl}. '
+            'Make sure server.py is running and your phone is on the same '
+            'WiFi network as your laptop. ($e)',
       );
     }
 
