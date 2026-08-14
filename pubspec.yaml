@@ -81,7 +81,8 @@ flutter:
     - images/communicating.png
     - images/WOMAN.png
     - assets/gesture_landmarks/
-    - assets/model/
+    - assets/model/ASL_CITIZEN_200_BiLSTM.tflite
+    - assets/model/class_list.txt
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
