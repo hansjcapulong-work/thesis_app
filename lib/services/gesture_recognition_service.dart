@@ -1,476 +1,326 @@
-import 'dart:convert';
-import 'dart:math' as math;
 import 'dart:typed_data';
-import 'package:http/http.dart' as http;
-import 'server_config.dart';
 
-/// ===========================================================================
-/// CLOUD-HYBRID VERSION.
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:tflite_flutter/tflite_flutter.dart';
+
+/// Mobile inference service for the 65-class hands-only sign recognition
+/// model (see the delivered README.md, v2). This REPLACES the previous
+/// ASL_CITIZEN_200 BiGRU model's contract entirely -- different input
+/// shape, no body pose input at all, different normalization, and a
+/// different segment-length strategy. Do not mix logic from the old
+/// service back in; the two models are not compatible.
 ///
-/// On-device: camera -> landmarks -> normalization -> motion-based
-/// segmentation. This part MUST stay on-device -- it needs to run in
-/// real time on every frame to detect when a sign starts/stops, and
-/// round-tripping raw frames to a server for that would add latency
-/// this logic isn't built to tolerate.
+/// Expected model input:  [1, 30, 126] float32
+///   30 = fixed sequence length (variable-length captures are resampled
+///        to exactly 30, see _resampleTo).
+///   126 = 2 hands x 21 landmarks x 3 coords (x, y, z), flattened.
+///         Hand order is fixed: index 0 = Left, index 1 = Right.
+/// Expected model output: [1, 65] float32 -- ALREADY softmax
+///   probabilities. Do NOT re-apply softmax on this output.
 ///
-/// Off-device: once a segment finishes (see [_endSegmentAndClassify]),
-/// the finished [200, 450] position+velocity sequence is POSTed to the
-/// SAME laptop server WhisperService talks to (see server_config.dart),
-/// hitting /recognize-gesture instead of /transcribe. This only fires
-/// once per completed sign (a few times a minute), not per frame, so
-/// the extra network round-trip is cheap relative to what it saves:
-/// no more on-device .tflite interpreter running, which was the
-/// likely source of the overheating (that, plus the pose/hand
-/// landmarkers below, which still run on-device -- see the note on
-/// [addFrame]).
-///
-/// No on-device fallback model is bundled per your call to go
-/// cloud-only for now -- if the server is unreachable, segments will
-/// simply fail to classify and onModelStatusChanged will report why.
-///
-/// Server-side expectations (server.py's /recognize-gesture):
-///   - Same model file as before: ASL_CITIZEN_200_BiLSTM.tflite
-///   - Same class_list.txt validation logic, ported to Python
-///   - Request:  {"sequence": [[450 floats] x 200]}
-///   - Response: {"label": "...", "confidence": 0.0-1.0}
-/// ===========================================================================
+/// Known limitations (from README):
+///  - Signer-dependent model (trained on 4 signers).
+///  - The "now" class has weaker training data; expect lower reliability.
+///  - Trained on LANDSCAPE input only; deploy in landscape.
 class GestureRecognitionService {
-  // --- Sequence -------------------------------------------------------------
-  // Model was trained on fixed 200-frame clips. Must match exactly.
-  static const int sequenceLength = 200;
+  static const int sequenceLength = 30;
+  static const int handCount = 2; // 0 = left, 1 = right
+  static const int handLandmarkCount = 21;
+  static const int coordsPerPoint = 3;
+  static const int featuresPerFrame =
+      handCount * handLandmarkCount * coordsPerPoint; // 126
+  static const int classCount = 65;
 
-  // --- Landmarks --------------------------------------------------------
-  // Order matters and MUST match training: pose, then left hand, then right hand.
-  static const int _poseLandmarkCount = 33;
-  static const int _handLandmarkCount = 21;
-  static const int totalLandmarks =
-      _poseLandmarkCount + _handLandmarkCount + _handLandmarkCount; // 75
+  /// Starting point; tune per on-device testing.
+  static const double confidenceThreshold = 0.65;
 
-  // Every landmark (pose + both hands) is x,y,z -- 3 coords.
-  static const int _coordsPerPoint = 3;
-  static const int positionFeatures = totalLandmarks * _coordsPerPoint; // 225
-  static const int velocityFeatures = positionFeatures; // 225, frame-to-frame delta
-  static const int featuresPerFrame = positionFeatures + velocityFeatures; // 450
+  /// Placeholders -- need real on-device calibration. Log a few live
+  /// idle-vs-signing motion values and adjust these two.
+  static const double motionStartThreshold = 0.6;
+  static const double motionIdleThreshold = 0.25;
+  static const int idleFramesToEndSegment = 10;
+  static const int minSegmentFrames = 6;
 
-  // Shoulder landmarks (within the pose block) used for normalization.
-  static const int _leftShoulderIdx = 11;
-  static const int _rightShoulderIdx = 12;
+  /// Safety cap so a segment can't grow forever if idle-detection never fires.
+  static const int maxSegmentFrames = sequenceLength * 20;
 
-  // Server returns a probability (post-softmax on its end), so this
-  // threshold means the same thing it did when softmax ran on-device.
-  static const double confidenceThreshold = 0.60;
+  static const String modelAssetPath =
+      'assets/model/sign_language_model.tflite';
+  static const String labelsAssetPath = 'assets/model/labels.txt';
 
-  static const Duration _requestTimeout = Duration(seconds: 15);
+  Interpreter? _interpreter;
+  List<String> _labels = <String>[];
 
-  // --- Motion-based segmentation ---------------------------------------
-  // This logic runs on-device and doesn't depend on where classification
-  // happens.
-  //
-  // _motionIdleThreshold was raised from the original 0.5 -- with hand
-  // landmarker jitter alone (landmarks drift a little frame-to-frame
-  // even when your hand is genuinely still), raw per-frame motion often
-  // never dropped below 0.5, so segments only ever ended by hitting the
-  // 200-frame cap, never by detecting "you stopped signing." Idle
-  // detection now also compares a SMOOTHED motion value (rolling
-  // average over _motionSmoothingWindow frames, see _smoothedIdleMotion)
-  // instead of the raw single-frame value, so a brief jitter spike
-  // doesn't reset the idle counter to 0.
-  //
-  // If idle-based segment ending still isn't triggering for you, set
-  // _debugMotion to true below and watch the console while you sign --
-  // it prints raw + smoothed motion every frame during capture, so you
-  // can see exactly where your "holding still" values land and tune
-  // _motionIdleThreshold to match.
-  static const double _motionStartThreshold = 1.2;
-  static const double _motionIdleThreshold = 0.8;
-  static const int _idleFramesToEndSegment = 10;
-  static const int _minSegmentFrames = 8;
-  static const int _motionSmoothingWindow = 4;
-
-  /// Set true to print raw/smoothed motion values to the console while
-  /// a segment is being captured. Turn off once tuned -- it's noisy.
-  static const bool _debugMotion = true;
-
-  // Frames captured since the current sign segment started (variable
-  // length, capped at sequenceLength). Cleared between segments.
-  final List<Float32List> _activeSegment = [];
+  final List<_CapturedFrame> _activeSegment = <_CapturedFrame>[];
+  Float32List? _lastFrame;
 
   bool _isCapturing = false;
   int _idleFrameCount = 0;
-  Float32List? _lastFrame;
-  bool _serverReachable = false;
 
-  // Rolling buffer of the last few raw motion values, used to compute
-  // _smoothedIdleMotion so single-frame jitter spikes don't keep
-  // resetting the idle counter.
-  final List<double> _recentMotion = [];
+  String modelStatus = 'Loading model...';
+  String lastPrediction = '—';
+  double lastConfidence = 0.0;
+  String tensorInfo = '—';
+  String lastError = '';
 
-  // Guards against overlapping requests if a segment finishes again
-  // before the previous classification call has returned.
-  bool _classifying = false;
-
-  /// Called with (recognizedWord, confidence) whenever a full 200-frame
-  /// window is classified above [confidenceThreshold].
-  void Function(String word, double confidence)? onGestureRecognized;
-
-  /// Called after EVERY segment is classified, regardless of whether it
-  /// cleared [confidenceThreshold] -- unlike [onGestureRecognized], this
-  /// always fires once a segment finishes and the server responds.
-  /// `accepted` is true exactly when [onGestureRecognized] also fired.
-  void Function(String topLabel, double confidence, bool accepted)? onSegmentClassified;
-
-  /// Called when a segment ends but was too short to bother classifying
-  /// (see [_minSegmentFrames]).
-  void Function(int capturedFrames, int minRequiredFrames)? onSegmentDiscarded;
-
-  /// Called once after checking the server, and again any time a
-  /// classification request fails (e.g. WiFi dropped, server crashed).
-  void Function(bool isLoaded, String message)? onModelStatusChanged;
-
-  bool get isModelLoaded => _serverReachable;
-
-  /// True while a sign segment is actively being captured.
+  bool get isModelLoaded =>
+      _interpreter != null && _labels.length == classCount;
   bool get isCapturingSegment => _isCapturing;
-
-  /// Number of frames currently buffered in the in-progress segment.
   int get activeSegmentLength => _activeSegment.length;
+  int get handClassCount => _labels.length;
 
-  /// Checks that the laptop server is reachable (GET /health, same
-  /// endpoint server.py already exposes for WhisperService). Doesn't
-  /// load anything locally -- there's no model or class list on-device
-  /// anymore, classification happens server-side.
+  void Function(bool isLoaded, String message)? onModelStatusChanged;
+  void Function(String word, double confidence)? onGestureRecognized;
+  void Function(String topLabel, double confidence, bool accepted)?
+  onSegmentClassified;
+  void Function(int captured, int minRequired)? onSegmentDiscarded;
+
   Future<void> loadModel() async {
     try {
-      final response = await http
-          .get(Uri.parse('${ServerConfig.baseUrl}/health'))
-          .timeout(const Duration(seconds: 5));
-      if (response.statusCode == 200) {
-        _serverReachable = true;
-        onModelStatusChanged?.call(
-          true,
-          'Connected to gesture server at ${ServerConfig.baseUrl}.',
-        );
-      } else {
-        _serverReachable = false;
-        onModelStatusChanged?.call(
-          false,
-          'Server responded with ${response.statusCode} at /health.',
+      lastError = '';
+      _interpreter = await Interpreter.fromAsset(modelAssetPath);
+
+      final input = _interpreter!.getInputTensor(0);
+      final output = _interpreter!.getOutputTensor(0);
+      tensorInfo = 'input shape=${input.shape} type=${input.type} | '
+          'output shape=${output.shape} type=${output.type}';
+
+      if (input.type != TensorType.float32 ||
+          output.type != TensorType.float32 ||
+          input.shape.length != 3 ||
+          input.shape[0] != 1 ||
+          input.shape[1] != sequenceLength ||
+          input.shape[2] != featuresPerFrame ||
+          output.shape.length != 2 ||
+          output.shape[0] != 1 ||
+          output.shape[1] != classCount) {
+        throw StateError('Unexpected TFLite tensor contract: $tensorInfo');
+      }
+
+      // labels.txt is one word per line; line index == class index.
+      final rawLabels = await rootBundle.loadString(labelsAssetPath);
+      final parsed = rawLabels
+          .split('\n')
+          .map((line) => line.trim())
+          .where((line) => line.isNotEmpty)
+          .toList();
+
+      if (parsed.length != classCount) {
+        throw StateError(
+          'Expected $classCount labels, found ${parsed.length} in $labelsAssetPath',
         );
       }
+
+      _labels = parsed;
+      modelStatus = 'Model loaded: ${_labels.length} classes';
+      onModelStatusChanged?.call(isModelLoaded, modelStatus);
     } catch (e) {
-      _serverReachable = false;
-      onModelStatusChanged?.call(
-        false,
-        'Could not reach the gesture server at ${ServerConfig.baseUrl}. '
-            'Make sure server.py is running and your phone is on the same '
-            'WiFi network as your laptop. ($e)',
-      );
+      _interpreter = null;
+      _labels = <String>[];
+      lastError = e.toString();
+      modelStatus = 'MODEL ERROR: $e';
+      onModelStatusChanged?.call(isModelLoaded, modelStatus);
+      rethrow;
     }
   }
 
-  /// Feeds one frame's worth of landmark data into the segmenter.
-  /// Pass null for anything not detected in this frame -- zero-padded.
-  ///
-  /// [poseLandmarks]: 33 [x, y, z] triples.
-  /// [leftHandLandmarks] / [rightHandLandmarks]: 21 [x, y, z] triples each.
-  ///
-  /// NOTE: pose data is required (not safely nullable) -- see
-  /// [_normalize]. Frames without real pose data are dropped here
-  /// rather than fed through, same as before.
-  ///
-  /// Call this every camera frame, continuously. Internally this still
-  /// runs entirely on-device: landmark extraction, normalization, and
-  /// motion-based segmentation don't change with this cloud-hybrid
-  /// setup. Only the final classification step (once per finished
-  /// segment) now goes over the network.
-  bool _warnedMissingPose = false;
-
+  /// Add one camera frame's hand landmarks (hands ONLY, no pose).
+  /// Each hand list, when present, must contain 21 normalized x/y/z
+  /// triples. Pass null for a hand that wasn't detected this frame; it is
+  /// written as zeros, and the frame counts as "no hand" only if BOTH are null.
   void addFrame({
-    required List<List<double>>? poseLandmarks,
     required List<List<double>>? leftHandLandmarks,
     required List<List<double>>? rightHandLandmarks,
   }) {
-    if (poseLandmarks == null || poseLandmarks.length < _poseLandmarkCount) {
-      if (!_warnedMissingPose) {
-        _warnedMissingPose = true;
-        onModelStatusChanged?.call(
-          false,
-          'No pose landmarks supplied -- gesture recognition needs shoulder '
-              'positions to normalize hand coordinates. Wire up a pose '
-              'landmarker alongside the hand landmarker before relying on '
-              'recognition results.',
-        );
-      }
-      return;
-    }
+    if (!isModelLoaded) return;
 
-    if (_warnedMissingPose) {
-      _warnedMissingPose = false;
-      onModelStatusChanged?.call(true, 'Pose landmarks flowing -- capturing normally.');
-    }
+    final handPresent =
+        leftHandLandmarks != null || rightHandLandmarks != null;
+    final raw = _buildRawVector(leftHandLandmarks, rightHandLandmarks);
+    final normalized = _normalizePerHand(raw);
 
-    final rawFrame = _buildRawPositionVector(
-      poseLandmarks,
-      leftHandLandmarks,
-      rightHandLandmarks,
-    );
-    final normalizedFrame = _normalize(rawFrame);
-
-    final motion = _lastFrame == null
-        ? 0.0
-        : _handMotion(_lastFrame!, normalizedFrame);
-    _lastFrame = normalizedFrame;
+    final motion =
+    _lastFrame == null ? 0.0 : _motion(_lastFrame!, normalized);
+    _lastFrame = normalized;
 
     if (!_isCapturing) {
-      // Raw (unsmoothed) motion for start detection -- responsiveness
-      // matters more than stability here, and a single-frame false
-      // start just gets cleaned up by _minSegmentFrames if it's noise.
-      if (motion > _motionStartThreshold) {
+      if (motion > motionStartThreshold) {
         _isCapturing = true;
         _idleFrameCount = 0;
-        _recentMotion.clear();
         _activeSegment.clear();
-        _activeSegment.add(normalizedFrame);
+        _activeSegment.add(_CapturedFrame(normalized, handPresent));
       }
       return;
     }
 
-    _activeSegment.add(normalizedFrame);
+    _activeSegment.add(_CapturedFrame(normalized, handPresent));
+    _idleFrameCount = motion < motionIdleThreshold ? _idleFrameCount + 1 : 0;
 
-    final smoothedMotion = _smoothedIdleMotion(motion);
-    if (_debugMotion) {
-      // ignore: avoid_print
-      print(
-        '[gesture] frame ${_activeSegment.length}: raw=${motion.toStringAsFixed(3)} '
-            'smoothed=${smoothedMotion.toStringAsFixed(3)} '
-            'idleCount=$_idleFrameCount (threshold=$_motionIdleThreshold)',
-      );
-    }
-    _idleFrameCount =
-    smoothedMotion < _motionIdleThreshold ? _idleFrameCount + 1 : 0;
+    final tooLong = _activeSegment.length >= maxSegmentFrames;
+    final wentIdle = _idleFrameCount >= idleFramesToEndSegment;
 
-    final hitMaxLength = _activeSegment.length >= sequenceLength;
-    final wentIdle = _idleFrameCount >= _idleFramesToEndSegment;
-
-    if (hitMaxLength || wentIdle) {
-      if (_debugMotion) {
-        // ignore: avoid_print
-        print(
-          '[gesture] segment ending: ${hitMaxLength ? "hit max length" : "went idle"} '
-              '(${_activeSegment.length} frames)',
-        );
-      }
+    if (tooLong || wentIdle) {
       _endSegmentAndClassify();
     }
   }
 
-  /// Rolling average of the last [_motionSmoothingWindow] raw motion
-  /// values. Filters out single-frame jitter spikes so idle detection
-  /// only responds to sustained stillness, not detector noise.
-  double _smoothedIdleMotion(double latestRawMotion) {
-    _recentMotion.add(latestRawMotion);
-    if (_recentMotion.length > _motionSmoothingWindow) {
-      _recentMotion.removeAt(0);
-    }
-    return _recentMotion.reduce((a, b) => a + b) / _recentMotion.length;
-  }
-
-  /// Sum of |delta| across the hand landmarks only, used as a cheap
-  /// motion signal to detect sign start/stop.
-  double _handMotion(Float32List prev, Float32List current) {
-    const handStart = _poseLandmarkCount * _coordsPerPoint; // 99
-    var total = 0.0;
-    for (int i = handStart; i < positionFeatures; i++) {
-      total += (current[i] - prev[i]).abs();
-    }
-    return total;
-  }
-
-  /// Finalizes the current segment, right-aligns/pads it, and kicks off
-  /// the (async, network-backed) classification call. Resets to idle
-  /// immediately -- classification happening asynchronously afterward
-  /// doesn't block new segments from starting.
-  void _endSegmentAndClassify() {
-    final captured = List.of(_activeSegment);
-    _activeSegment.clear();
-    _isCapturing = false;
-    _idleFrameCount = 0;
-    _recentMotion.clear();
-
-    if (captured.length < _minSegmentFrames) {
-      onSegmentDiscarded?.call(captured.length, _minSegmentFrames);
-      return;
-    }
-
-    final aligned = _rightAlignAndPad(captured);
-    // Fire-and-forget: addFrame() callers don't await this, matching
-    // the old synchronous call's "not blocking the frame loop" behavior.
-    _classifyRemote(aligned);
-  }
-
-  /// Builds an exactly-`sequenceLength`-long list of position frames:
-  ///   - if `frames` is shorter, pad the FRONT with zero vectors
-  ///   - if `frames` is longer, keep the LAST `sequenceLength` frames
-  List<Float32List> _rightAlignAndPad(List<Float32List> frames) {
-    if (frames.length == sequenceLength) return frames;
-
-    if (frames.length > sequenceLength) {
-      return frames.sublist(frames.length - sequenceLength);
-    }
-
-    final padCount = sequenceLength - frames.length;
-    final zeroFrame = Float32List(positionFeatures); // all zeros
-    return [
-      for (int i = 0; i < padCount; i++) zeroFrame,
-      ...frames,
-    ];
-  }
-
-  /// Flattens pose + left hand + right hand into one 225-value vector,
-  /// in the exact order the model was trained on: pose(0-32), left
-  /// hand(33-53), right hand(54-74), each as x,y,z.
-  Float32List _buildRawPositionVector(
-      List<List<double>>? pose,
+  Float32List _buildRawVector(
       List<List<double>>? left,
       List<List<double>>? right,
       ) {
-    final values = Float32List(positionFeatures);
-    int i = 0;
+    final values = Float32List(featuresPerFrame);
+    var index = 0;
 
-    void writeBlock(List<List<double>>? points, int count) {
-      for (int j = 0; j < count; j++) {
-        final point =
-        (points != null && j < points.length) ? points[j] : const [0.0, 0.0, 0.0];
-        values[i++] = point[0];
-        values[i++] = point.length > 1 ? point[1] : 0.0;
-        values[i++] = point.length > 2 ? point[2] : 0.0;
+    void writeHand(List<List<double>>? points) {
+      for (var i = 0; i < handLandmarkCount; i++) {
+        final point = (points != null && i < points.length)
+            ? points[i]
+            : const <double>[0.0, 0.0, 0.0];
+        values[index++] = point.isNotEmpty ? point[0] : 0.0;
+        values[index++] = point.length > 1 ? point[1] : 0.0;
+        values[index++] = point.length > 2 ? point[2] : 0.0;
       }
     }
 
-    writeBlock(pose, _poseLandmarkCount);
-    writeBlock(left, _handLandmarkCount);
-    writeBlock(right, _handLandmarkCount);
+    writeHand(left); // hand 0 = Left
+    writeHand(right); // hand 1 = Right
     return values;
   }
 
-  /// Shoulder-center subtraction + shoulder-width scaling, per
-  /// preprocessing_spec.json.
-  Float32List _normalize(Float32List raw) {
-    final leftShoulderOffset = _leftShoulderIdx * _coordsPerPoint;
-    final rightShoulderOffset = _rightShoulderIdx * _coordsPerPoint;
-
-    final lx = raw[leftShoulderOffset];
-    final ly = raw[leftShoulderOffset + 1];
-    final lz = raw[leftShoulderOffset + 2];
-    final rx = raw[rightShoulderOffset];
-    final ry = raw[rightShoulderOffset + 1];
-    final rz = raw[rightShoulderOffset + 2];
-
-    final centerX = (lx + rx) / 2.0;
-    final centerY = (ly + ry) / 2.0;
-    final centerZ = (lz + rz) / 2.0;
-
-    final dx = rx - lx, dy = ry - ly, dz = rz - lz;
-    var shoulderWidth = math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (shoulderWidth < 1e-6) shoulderWidth = 1e-6;
-
+  /// README step 3: subtract each hand's OWN wrist (landmark 0) from all of
+  /// its landmarks. Plain subtraction only, no scale division.
+  Float32List _normalizePerHand(Float32List raw) {
     final out = Float32List(raw.length);
-    for (int i = 0; i < raw.length; i += 3) {
-      out[i] = (raw[i] - centerX) / shoulderWidth;
-      out[i + 1] = (raw[i + 1] - centerY) / shoulderWidth;
-      out[i + 2] = (raw[i + 2] - centerZ) / shoulderWidth;
+    final handStride = handLandmarkCount * coordsPerPoint; // 63
+
+    for (var hand = 0; hand < handCount; hand++) {
+      final base = hand * handStride;
+      final wristX = raw[base];
+      final wristY = raw[base + 1];
+      final wristZ = raw[base + 2];
+      for (var i = 0; i < handStride; i += 3) {
+        out[base + i] = raw[base + i] - wristX;
+        out[base + i + 1] = raw[base + i + 1] - wristY;
+        out[base + i + 2] = raw[base + i + 2] - wristZ;
+      }
     }
     return out;
   }
 
-  /// Builds the [200, 450] position+velocity sequence (same math as the
-  /// on-device version -- kept in Dart rather than duplicated in Python
-  /// so there's one source of truth for this preprocessing step), then
-  /// POSTs it to /recognize-gesture and dispatches the same callbacks
-  /// the on-device version used to fire directly.
-  Future<void> _classifyRemote(List<Float32List> positionFrames) async {
-    if (_classifying) return; // drop overlapping requests rather than queue
-    _classifying = true;
+  double _motion(Float32List previous, Float32List current) {
+    var total = 0.0;
+    for (var i = 0; i < current.length; i++) {
+      total += (current[i] - previous[i]).abs();
+    }
+    return total;
+  }
+
+  void _endSegmentAndClassify() {
+    final captured = List<_CapturedFrame>.from(_activeSegment);
+    _activeSegment.clear();
+    _isCapturing = false;
+    _idleFrameCount = 0;
+
+    // README step 4 (trim): drop leading/trailing frames with no hand.
+    var start = 0;
+    var end = captured.length - 1;
+    while (start <= end && !captured[start].handPresent) {
+      start++;
+    }
+    while (end >= start && !captured[end].handPresent) {
+      end--;
+    }
+
+    if (start > end) {
+      onSegmentDiscarded?.call(0, minSegmentFrames);
+      return;
+    }
+
+    final trimmed = captured.sublist(start, end + 1);
+
+    if (trimmed.length < minSegmentFrames) {
+      onSegmentDiscarded?.call(trimmed.length, minSegmentFrames);
+      return;
+    }
+
+    final resampled =
+    _resampleTo(trimmed.map((f) => f.vector).toList(), sequenceLength);
+    _runInference(resampled);
+  }
+
+  /// README step 4 (resample): NEAREST-NEIGHBOR index selection, evenly
+  /// spaced -- NOT linear interpolation. Equivalent to
+  /// np.linspace(0, n-1, 30).round().astype(int) in the training pipeline.
+  /// If your training script used int() truncation, change .round() to .floor().
+  List<Float32List> _resampleTo(List<Float32List> frames, int targetLength) {
+    if (frames.length == targetLength) return frames;
+
+    final result = <Float32List>[];
+    final lastIndex = frames.length - 1;
+
+    for (var t = 0; t < targetLength; t++) {
+      final pos =
+      targetLength == 1 ? 0.0 : (t * lastIndex) / (targetLength - 1);
+      final idx = pos.round().clamp(0, lastIndex);
+      result.add(Float32List.fromList(frames[idx]));
+    }
+    return result;
+  }
+
+  void _runInference(List<Float32List> frames) {
+    final interpreter = _interpreter;
+    if (interpreter == null) return;
+
+    final sequence = frames.map((f) => f.toList()).toList();
+    final input = <List<List<double>>>[sequence];
+    final output = <List<double>>[List<double>.filled(classCount, 0.0)];
 
     try {
-      final sequence = List.generate(sequenceLength, (t) {
-        final frame = Float32List(featuresPerFrame);
-        final pos = positionFrames[t];
-        for (int k = 0; k < positionFeatures; k++) {
-          frame[k] = pos[k];
-        }
-        if (t == 0) {
-          for (int k = 0; k < velocityFeatures; k++) {
-            frame[positionFeatures + k] = 0.0;
-          }
-        } else {
-          final prev = positionFrames[t - 1];
-          for (int k = 0; k < velocityFeatures; k++) {
-            frame[positionFeatures + k] = pos[k] - prev[k];
-          }
-        }
-        return frame.toList();
-      });
+      interpreter.run(input, output);
+    } catch (e) {
+      lastError = 'Inference failed: $e';
+      return;
+    }
 
-      http.Response response;
-      try {
-        response = await http
-            .post(
-          Uri.parse('${ServerConfig.baseUrl}/recognize-gesture'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'sequence': sequence}),
-        )
-            .timeout(_requestTimeout);
-      } catch (e) {
-        onModelStatusChanged?.call(
-          false,
-          'Could not reach the gesture server at ${ServerConfig.baseUrl}. '
-              'Make sure server.py is running and your phone is on the same '
-              'WiFi network as your laptop. ($e)',
-        );
-        return;
+    // Output is already softmax probabilities -- do not re-apply softmax.
+    final probs = output[0];
+    var bestIndex = 0;
+    var best = probs[0];
+    for (var i = 1; i < probs.length; i++) {
+      if (probs[i] > best) {
+        best = probs[i];
+        bestIndex = i;
       }
+    }
 
-      if (response.statusCode != 200) {
-        onModelStatusChanged?.call(
-          false,
-          'Gesture server error (${response.statusCode}): ${response.body}',
-        );
-        return;
-      }
+    lastPrediction = _labels[bestIndex];
+    lastConfidence = best;
 
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final label = data['label'] as String?;
-      final confidence = (data['confidence'] as num?)?.toDouble();
-
-      if (label == null || confidence == null) {
-        onModelStatusChanged?.call(
-          false,
-          'Gesture server returned an unexpected response: ${response.body}',
-        );
-        return;
-      }
-
-      final accepted = confidence >= confidenceThreshold;
-      onSegmentClassified?.call(label, confidence, accepted);
-      if (accepted) {
-        onGestureRecognized?.call(label, confidence);
-      }
-    } finally {
-      _classifying = false;
+    final accepted = best >= confidenceThreshold;
+    onSegmentClassified?.call(lastPrediction, best, accepted);
+    if (accepted) {
+      onGestureRecognized?.call(lastPrediction, best);
     }
   }
 
-  /// Clears the current in-progress segment without classifying it.
-  void resetBuffer() {
+  void reset() {
     _activeSegment.clear();
     _isCapturing = false;
     _idleFrameCount = 0;
     _lastFrame = null;
-    _recentMotion.clear();
+    lastPrediction = '—';
+    lastConfidence = 0.0;
+    lastError = '';
   }
 
   void dispose() {
-    // Nothing to close -- no local interpreter anymore.
+    _interpreter?.close();
+    _interpreter = null;
   }
+}
+
+class _CapturedFrame {
+  final Float32List vector;
+  final bool handPresent;
+  _CapturedFrame(this.vector, this.handPresent);
 }

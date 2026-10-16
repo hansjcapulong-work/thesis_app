@@ -3,7 +3,6 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import '../widgets/custom_text_field.dart';
-import '../data/bubble_visibility.dart';
 import 'register_screen.dart';
 import 'dashboard_screen.dart';
 import 'forgot_password_screen.dart';
@@ -23,7 +22,6 @@ class _LoginScreenState extends State<LoginScreen> {
   @override
   void initState() {
     super.initState();
-    bubbleVisible.value = false;
   }
 
   @override

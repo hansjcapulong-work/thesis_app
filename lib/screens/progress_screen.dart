@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import '../data/asl_words.dart';
 import '../data/progress_service.dart';
 import '../widgets/app_bottom_nav.dart';
+import '../widgets/skeleton_loader.dart';
+import '../utils/slide_page_route.dart';
 import 'notifications_screen.dart';
 import 'settings_screen.dart';
 
@@ -50,7 +52,7 @@ class _ProgressScreenState extends State<ProgressScreen> {
         title: const Text('Progress', style: TextStyle(color: Color(0xFF2A1B38), fontWeight: FontWeight.bold)),
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator(color: Color(0xFF2A1B38)))
+          ? const ProgressScreenSkeleton()
           : ListView(
         padding: const EdgeInsets.all(24),
         children: [
@@ -117,9 +119,16 @@ class _ProgressScreenState extends State<ProgressScreen> {
       bottomNavigationBar: AppBottomNav(
         currentIndex: 1,
         onTap: (i) {
-          if (i == 0) Navigator.pop(context);
-          if (i == 2) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const NotificationsScreen()));
-          if (i == 3) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
+          if (i == 1) return;
+          if (i == 0) {
+            Navigator.pop(context);
+            return;
+          }
+          final Widget target = i == 2 ? const NotificationsScreen() : const SettingsScreen();
+          Navigator.pushReplacement(
+            context,
+            slideToTabRoute(page: target, fromIndex: 1, toIndex: i),
+          );
         },
       ),
     );

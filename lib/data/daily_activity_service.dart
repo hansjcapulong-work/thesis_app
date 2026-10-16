@@ -1,6 +1,12 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
+class GoalUpdateResult {
+  final bool justCompletedGoal;
+  final int goalMinutes;
+  const GoalUpdateResult({required this.justCompletedGoal, required this.goalMinutes});
+}
+
 class DailyActivityService {
   static String? get _uid => FirebaseAuth.instance.currentUser?.uid;
 
@@ -15,26 +21,36 @@ class DailyActivityService {
 
   /// Adds practiced seconds to today's record and logs what was done.
   /// Marks the day as goal-completed once total seconds pass the user's
-  /// chosen daily goal (in minutes).
-  static Future<void> logActivity({
+  /// chosen daily goal (in minutes). Returns a result telling the caller
+  /// whether the goal was *just* reached by this call (i.e. it was not
+  /// already completed before), so the UI can show a one-time notification
+  /// instead of repeating it on every subsequent activity that day.
+  static Future<GoalUpdateResult> logActivity({
     required int secondsSpent,
     required String type,
     required String label,
   }) async {
     final col = _col;
     final uid = _uid;
-    if (col == null || uid == null || secondsSpent <= 0) return;
+    if (col == null || uid == null || secondsSpent <= 0) {
+      return const GoalUpdateResult(justCompletedGoal: false, goalMinutes: 0);
+    }
 
     final userDoc = await FirebaseFirestore.instance.collection('users').doc(uid).get();
     final goalMinutes = (userDoc.data()?['dailyGoalMinutes'] as int?) ?? 0;
 
     final docRef = col.doc(dateKey(DateTime.now()));
 
+    bool justCompleted = false;
+
     await FirebaseFirestore.instance.runTransaction((tx) async {
       final snap = await tx.get(docRef);
       final currentSeconds = (snap.data()?['secondsPracticed'] as int?) ?? 0;
+      final wasCompleted = snap.data()?['completedGoal'] == true;
       final newSeconds = currentSeconds + secondsSpent;
       final completed = goalMinutes > 0 && newSeconds >= goalMinutes * 60;
+
+      justCompleted = completed && !wasCompleted;
 
       final activities = List<Map<String, dynamic>>.from(
         (snap.data()?['activities'] as List?) ?? [],
@@ -45,12 +61,22 @@ class DailyActivityService {
         'time': DateTime.now().toIso8601String(),
       });
 
+      if (justCompleted) {
+        activities.add({
+          'type': 'goal',
+          'label': goalMinutes > 0 ? 'Reached $goalMinutes min daily goal' : 'Daily goal completed',
+          'time': DateTime.now().toIso8601String(),
+        });
+      }
+
       tx.set(docRef, {
         'secondsPracticed': newSeconds,
         'completedGoal': completed,
         'activities': activities,
       }, SetOptions(merge: true));
     });
+
+    return GoalUpdateResult(justCompletedGoal: justCompleted, goalMinutes: goalMinutes);
   }
 
   static Future<Map<String, dynamic>?> getDay(DateTime d) async {

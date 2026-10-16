@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../data/asl_words.dart';
 import '../data/progress_service.dart';
+import '../widgets/skeleton_loader.dart';
 import 'category_words_screen.dart';
 
 class SelectCollectionScreen extends StatefulWidget {
@@ -82,7 +83,7 @@ class _SelectCollectionScreenState extends State<SelectCollectionScreen> {
               const SizedBox(height: 20),
               Expanded(
                 child: _loading
-                    ? const Center(child: CircularProgressIndicator(color: Color(0xFF2A1B38)))
+                    ? const SelectCollectionScreenSkeleton()
                     : ListView.separated(
                   itemCount: filteredCategories.length,
                   separatorBuilder: (_, __) => const SizedBox(height: 16),

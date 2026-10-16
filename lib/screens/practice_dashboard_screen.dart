@@ -7,6 +7,8 @@ import '../data/daily_activity_service.dart';
 import '../widgets/app_bottom_nav.dart';
 import 'select_collection_screen.dart';
 import 'category_words_screen.dart';
+import '../widgets/skeleton_loader.dart';
+import '../utils/route_observer.dart';
 import 'progress_screen.dart';
 import 'notifications_screen.dart';
 import 'settings_screen.dart';
@@ -19,18 +21,50 @@ class PracticeDashboardScreen extends StatefulWidget {
   State<PracticeDashboardScreen> createState() => _PracticeDashboardScreenState();
 }
 
-class _PracticeDashboardScreenState extends State<PracticeDashboardScreen> {
+class _PracticeDashboardScreenState extends State<PracticeDashboardScreen> with RouteAware {
   Map<String, CategoryProgress> _progress = {};
   bool _loadingProgress = true;
   int _streak = 0;
+  bool _loadingStreak = true;
+  final GlobalKey<_WeekTrackerState> _weekTrackerKey = GlobalKey<_WeekTrackerState>();
 
   @override
   void initState() {
     super.initState();
     _loadProgress();
     DailyActivityService.getCurrentStreak().then((s) {
-      if (mounted) setState(() => _streak = s);
+      if (mounted) setState(() {
+        _streak = s;
+        _loadingStreak = false;
+      });
     });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    routeObserver.subscribe(this, ModalRoute.of(context)! as PageRoute);
+  }
+
+  @override
+  void dispose() {
+    routeObserver.unsubscribe(this);
+    super.dispose();
+  }
+
+  /// Called automatically whenever the user comes back to this screen
+  /// after a pushed screen (word list, quiz, etc.) is popped — this is
+  /// what fixes the tracker not updating until a full re-entry.
+  @override
+  void didPopNext() {
+    _loadProgress();
+    _refreshStreak();
+    _weekTrackerKey.currentState?.reload();
+  }
+
+  Future<void> _refreshStreak() async {
+    final s = await DailyActivityService.getCurrentStreak();
+    if (mounted) setState(() => _streak = s);
   }
 
   Future<void> _loadProgress() async {
@@ -140,13 +174,13 @@ class _PracticeDashboardScreenState extends State<PracticeDashboardScreen> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                const _WeekTracker(),
+                _WeekTracker(key: _weekTrackerKey),
                 const SizedBox(height: 24),
                 Row(
                   children: [
                     Expanded(child: _signOfTheDayCard()),
                     const SizedBox(width: 14),
-                    Expanded(child: _streakCard(_streak)),
+                    Expanded(child: _streakCard(_streak, _loadingStreak)),
                   ],
                 ),
               ],
@@ -181,7 +215,7 @@ class _PracticeDashboardScreenState extends State<PracticeDashboardScreen> {
     );
   }
 
-  Widget _streakCard(int streak) {
+  Widget _streakCard(int streak, bool loading) {
     return Container(
       height: 130,
       padding: const EdgeInsets.all(16),
@@ -191,7 +225,9 @@ class _PracticeDashboardScreenState extends State<PracticeDashboardScreen> {
         children: [
           const Text('Practice\nStreak', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15)),
           const Spacer(),
-          Text('$streak', style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
+          loading
+              ? SkeletonBox(height: 26, width: 40, borderRadius: BorderRadius.circular(6))
+              : Text('$streak', style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
         ],
       ),
     );
@@ -280,7 +316,7 @@ class _CyclingCollectionCardState extends State<_CyclingCollectionCard> {
 }
 
 class _WeekTracker extends StatefulWidget {
-  const _WeekTracker();
+  const _WeekTracker({Key? key}) : super(key: key);
 
   @override
   State<_WeekTracker> createState() => _WeekTrackerState();
@@ -288,6 +324,7 @@ class _WeekTracker extends StatefulWidget {
 
 class _WeekTrackerState extends State<_WeekTracker> {
   Map<String, Map<String, dynamic>> _monthData = {};
+  bool _loading = true;
 
   @override
   void initState() {
@@ -299,9 +336,15 @@ class _WeekTrackerState extends State<_WeekTracker> {
     final now = DateTime.now();
     final data = await DailyActivityService.getMonth(now.year, now.month);
     if (!mounted) return;
-    setState(() => _monthData = data);
+    setState(() {
+      _monthData = data;
+      _loading = false;
+    });
   }
 
+  /// Public so the parent screen can trigger a refresh (via GlobalKey)
+  /// when the user returns to the dashboard after logging new activity.
+  Future<void> reload() => _load();
   void _showDayDetail(DateTime day) {
     final key = DailyActivityService.dateKey(day);
     final data = _monthData[key];
@@ -310,38 +353,75 @@ class _WeekTrackerState extends State<_WeekTracker> {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.white,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '${monthNames[day.month - 1]} ${day.day}, ${day.year}',
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF2A1B38)),
+      builder: (sheetContext) {
+        final maxHeight = MediaQuery.of(sheetContext).size.height * 0.75;
+        return ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxHeight),
+          child: SingleChildScrollView(
+            padding: EdgeInsets.only(
+              left: 24,
+              right: 24,
+              top: 24,
+              bottom: 24 + MediaQuery.of(sheetContext).viewPadding.bottom,
             ),
-            const SizedBox(height: 12),
-            if (activities.isEmpty)
-              const Text('No activity recorded this day.', style: TextStyle(color: Colors.grey))
-            else ...[
-              Text(
-                '${(((data?['secondsPracticed'] as int?) ?? 0) / 60).round()} minutes practiced',
-                style: const TextStyle(color: Colors.grey),
-              ),
-              const SizedBox(height: 10),
-              ...activities.map((a) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Text(
-                  '• ${a['type'] == 'quiz' ? 'Took quiz: ' : 'Watched: '}${a['label']}',
-                  style: const TextStyle(color: Color(0xFF2A1B38)),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2)),
+                  ),
                 ),
-              )),
-            ],
-            const SizedBox(height: 10),
-          ],
-        ),
-      ),
+                Text(
+                  '${monthNames[day.month - 1]} ${day.day}, ${day.year}',
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF2A1B38)),
+                ),
+                const SizedBox(height: 12),
+                if (activities.isEmpty)
+                  const Text('No activity recorded this day.', style: TextStyle(color: Colors.grey))
+                else ...[
+                  Text(
+                    '${(((data?['secondsPracticed'] as int?) ?? 0) / 60).round()} minutes practiced',
+                    style: const TextStyle(color: Colors.grey),
+                  ),
+                  const SizedBox(height: 10),
+                  ...activities.map((a) {
+                    if (a['type'] == 'goal') {
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.emoji_events_rounded, size: 16, color: Colors.amber),
+                            const SizedBox(width: 6),
+                            Text(
+                              a['label'] ?? 'Daily goal completed',
+                              style: const TextStyle(color: Color(0xFF2A1B38), fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+                    final prefix = a['type'] == 'quiz' ? 'Took quiz: ' : 'Watched: ';
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Text(
+                        '• $prefix${a['label']}',
+                        style: const TextStyle(color: Color(0xFF2A1B38)),
+                      ),
+                    );
+                  }),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -359,10 +439,13 @@ class _WeekTrackerState extends State<_WeekTracker> {
       children: [
         Text(monthLabel, style: const TextStyle(color: Colors.grey, fontWeight: FontWeight.w600, fontSize: 13)),
         const SizedBox(height: 8),
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: Row(
-            children: days.map((day) {
+        if (_loading)
+          const WeekTrackerSkeleton()
+        else
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: days.map((day) {
               final isToday = day.year == now.year && day.month == now.month && day.day == now.day;
               final key = DailyActivityService.dateKey(day);
               final completed = _monthData[key]?['completedGoal'] == true;
@@ -378,20 +461,38 @@ class _WeekTrackerState extends State<_WeekTracker> {
                     decoration: BoxDecoration(
                       color: completed ? const Color(0xFF2A1B38) : Colors.grey.shade200,
                       borderRadius: BorderRadius.circular(14),
-                      border: isToday && !completed ? Border.all(color: const Color(0xFF2A1B38), width: 1.5) : null,
+                      border: isToday
+                          ? Border.all(color: completed ? Colors.greenAccent : const Color(0xFF2A1B38), width: 1.5)
+                          : null,
                     ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      alignment: Alignment.center,
                       children: [
-                        Text(
-                          weekdayLabels[day.weekday - 1],
-                          style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: completed ? Colors.white : Colors.grey.shade700),
+                        Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              weekdayLabels[day.weekday - 1],
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: completed ? Colors.white : Colors.grey.shade700),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${day.day}',
+                              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: completed ? Colors.white : const Color(0xFF2A1B38)),
+                            ),
+                          ],
                         ),
-                        const SizedBox(height: 4),
-                        Text(
-                          '${day.day}',
-                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: completed ? Colors.white : const Color(0xFF2A1B38)),
-                        ),
+                        if (completed)
+                          const Positioned(
+                            top: -6,
+                            right: -6,
+                            child: CircleAvatar(
+                              radius: 9,
+                              backgroundColor: Colors.greenAccent,
+                              child: Icon(Icons.emoji_events_rounded, size: 11, color: Color(0xFF2A1B38)),
+                            ),
+                          ),
                       ],
                     ),
                   ),

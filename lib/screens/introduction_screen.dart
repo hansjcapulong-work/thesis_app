@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'login_screen.dart';
 
 // 1. Introduction Screen
@@ -51,7 +52,11 @@ class IntroTwoScreen extends StatelessWidget {
         const Text('Connect and communicate with ease', style: TextStyle(fontSize: 14, color: Colors.grey)),
         const Spacer(),
         ElevatedButton(
-          onPressed: () {
+          onPressed: () async {
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setBool('hasSeenIntro', true);
+
+            if (!context.mounted) return;
             Navigator.pushAndRemoveUntil(
               context,
               PageRouteBuilder(

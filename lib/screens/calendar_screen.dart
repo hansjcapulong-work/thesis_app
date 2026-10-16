@@ -42,38 +42,75 @@ class _CalendarScreenState extends State<CalendarScreen> {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.white,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '${monthNames[day.month - 1]} ${day.day}, ${day.year}',
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF2A1B38)),
+      builder: (sheetContext) {
+        final maxHeight = MediaQuery.of(sheetContext).size.height * 0.75;
+        return ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxHeight),
+          child: SingleChildScrollView(
+            padding: EdgeInsets.only(
+              left: 24,
+              right: 24,
+              top: 24,
+              bottom: 24 + MediaQuery.of(sheetContext).viewPadding.bottom,
             ),
-            const SizedBox(height: 12),
-            if (activities.isEmpty)
-              const Text('No activity recorded this day.', style: TextStyle(color: Colors.grey))
-            else ...[
-              Text(
-                '${(((data?['secondsPracticed'] as int?) ?? 0) / 60).round()} minutes practiced',
-                style: const TextStyle(color: Colors.grey),
-              ),
-              const SizedBox(height: 10),
-              ...activities.map((a) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 4),
-                child: Text(
-                  '• ${a['type'] == 'quiz' ? 'Took quiz: ' : 'Watched: '}${a['label']}',
-                  style: const TextStyle(color: Color(0xFF2A1B38)),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 36,
+                    height: 4,
+                    margin: const EdgeInsets.only(bottom: 16),
+                    decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(2)),
+                  ),
                 ),
-              )),
-            ],
-            const SizedBox(height: 10),
-          ],
-        ),
-      ),
+                Text(
+                  '${monthNames[day.month - 1]} ${day.day}, ${day.year}',
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF2A1B38)),
+                ),
+                const SizedBox(height: 12),
+                if (activities.isEmpty)
+                  const Text('No activity recorded this day.', style: TextStyle(color: Colors.grey))
+                else ...[
+                  Text(
+                    '${(((data?['secondsPracticed'] as int?) ?? 0) / 60).round()} minutes practiced',
+                    style: const TextStyle(color: Colors.grey),
+                  ),
+                  const SizedBox(height: 10),
+                  ...activities.map((a) {
+                    if (a['type'] == 'goal') {
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.emoji_events_rounded, size: 16, color: Colors.amber),
+                            const SizedBox(width: 6),
+                            Text(
+                              a['label'] ?? 'Daily goal completed',
+                              style: const TextStyle(color: Color(0xFF2A1B38), fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+                    final prefix = a['type'] == 'quiz' ? 'Took quiz: ' : 'Watched: ';
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Text(
+                        '• $prefix${a['label']}',
+                        style: const TextStyle(color: Color(0xFF2A1B38)),
+                      ),
+                    );
+                  }),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 

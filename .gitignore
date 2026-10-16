@@ -33,6 +33,7 @@ migrate_working_dir/
 /build/
 /coverage/
 
+
 # Symbolication related
 app.*.symbols
 
@@ -51,3 +52,5 @@ whisper_server/.venv/
 whisper_server/__pycache__/
 **/__pycache__/
 *.pyc
+
+env.json

@@ -45,7 +45,7 @@ class ASLPracticeScreen extends StatelessWidget {
   }
 
   Widget _wordChip(BuildContext context, ASLWord word) {
-    final hasVideo = word.landmarksAsset != null;
+    final hasVideo = word.hasSign;
 
     return GestureDetector(
       onTap: () {

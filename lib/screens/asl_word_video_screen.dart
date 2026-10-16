@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import '../data/asl_words.dart';
 import '../data/progress_service.dart';
+import '../data/daily_activity_service.dart';
 import '../widgets/skeletal_gesture_viewer.dart';
+import '../widgets/goal_completed_banner.dart';
 
 class ASLWordVideoScreen extends StatefulWidget {
   final ASLWord word;
@@ -16,25 +18,59 @@ class _ASLWordVideoScreenState extends State<ASLWordVideoScreen> {
   // forces it to remount and restart the animation from frame 0 --
   // our replacement for YoutubePlayerController.seekTo(Duration.zero).
   int _replayCount = 0;
+  final Stopwatch _stopwatch = Stopwatch();
+  bool _exiting = false;
 
   @override
   void initState() {
     super.initState();
     ProgressService.markWordWatched(widget.word.category, widget.word.word);
+    _stopwatch.start();
+  }
+
+  /// Logs the time spent on this specific word (not just the category),
+  /// then shows a one-time banner if this activity just crossed the
+  /// user's daily goal, then actually leaves the screen. Run before the
+  /// pop (not in dispose()) so we still have a valid context to show
+  /// the banner with.
+  Future<void> _exit() async {
+    if (_exiting) return;
+    _exiting = true;
+
+    _stopwatch.stop();
+    final result = await DailyActivityService.logActivity(
+      secondsSpent: _stopwatch.elapsed.inSeconds,
+      type: 'watched',
+      label: widget.word.word,
+    );
+
+    if (!mounted) return;
+
+    if (result.justCompletedGoal) {
+      showGoalCompletedBanner(context, goalMinutes: result.goalMinutes);
+    }
+
+    Navigator.pop(context);
   }
 
   @override
   Widget build(BuildContext context) {
     final asset = widget.word.landmarksAsset;
 
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Colors.white,
-        elevation: 0,
-        iconTheme: const IconThemeData(color: Color(0xFF2A1B38)),
-        title: Text(widget.word.word, style: const TextStyle(color: Color(0xFF2A1B38), fontWeight: FontWeight.bold)),
-      ),
-      body: Column(
+    return PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, result) {
+          if (didPop) return;
+          _exit();
+        },
+        child: Scaffold(
+          appBar: AppBar(
+            backgroundColor: Colors.white,
+            elevation: 0,
+            iconTheme: const IconThemeData(color: Color(0xFF2A1B38)),
+            title: Text(widget.word.word, style: const TextStyle(color: Color(0xFF2A1B38), fontWeight: FontWeight.bold)),
+          ),
+          body: Column(
         children: [
           const SizedBox(height: 20),
           if (asset != null)
@@ -86,7 +122,8 @@ class _ASLWordVideoScreenState extends State<ASLWordVideoScreen> {
               ),
             ),
         ],
-      ),
+          ),
+        ),
     );
   }
 }

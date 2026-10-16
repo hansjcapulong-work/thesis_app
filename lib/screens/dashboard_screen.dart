@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:fluttertoast/fluttertoast.dart';
-import '../data/bubble_visibility.dart';
 import '../widgets/app_bottom_nav.dart';
 import 'login_screen.dart';
 import 'practice_dashboard_screen.dart';
@@ -47,7 +46,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     if (confirmed != true) return;
     if (!context.mounted) return;
 
-    bubbleVisible.value = false;
     await FirebaseAuth.instance.signOut();
     if (!context.mounted) return;
     Navigator.pushAndRemoveUntil(
@@ -87,23 +85,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
           backgroundColor: Colors.white,
           elevation: 0,
           automaticallyImplyLeading: false,
+          leading: IconButton(
+            icon: const Icon(Icons.history_rounded, color: Color(0xFF2A1B38), size: 32),
+            tooltip: 'History',
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryScreen())),
+          ),
           actions: [
             IconButton(
-              icon: const Icon(Icons.logout, color: Color(0xFF2A1B38)),
+              icon: const Icon(Icons.logout, color: Color(0xFF2A1B38), size: 32),
               tooltip: 'Log out',
               onPressed: () => _logout(context),
             ),
           ],
         ),
         body: SafeArea(child: SingleChildScrollView(padding: const EdgeInsets.all(24), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(
-            'Hello, ${FirebaseAuth.instance.currentUser?.displayName ?? 'there'}!\nWhat would you\nlike to do today?',
-            style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 60),
-          GestureDetector(
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const PracticeDashboardScreen())),
-            child: _build3DCard('Practice ASL', 'Learn and practice.', 'images/WOMAN.png', false),
+          const Text(
+            'What would you\nlike to do today?',
+            style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 60),
           GestureDetector(
@@ -112,8 +110,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 60),
           GestureDetector(
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryScreen())),
-            child: _build3DCardIcon('History', 'Past conversations.', Icons.history_rounded, true),
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const PracticeDashboardScreen())),
+            child: _build3DCard('Practice ASL', 'Learn and practice.', 'images/WOMAN.png', false),
           ),
         ]))),
 
@@ -126,16 +124,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
       Positioned(top: 15, left: -12, right: 12, bottom: -12, child: Container(decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)))),
       Container(width: double.infinity, decoration: BoxDecoration(color: const Color(0xFF2A1B38), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)), padding: EdgeInsets.only(left: isRight ? 24 : 140, right: isRight ? 140 : 24, top: 25), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)), Text(sub, style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 11))])),
       Positioned(left: isRight ? null : -25, right: isRight ? -25 : null, top: -35, bottom: -5, child: Image.asset(img)),
-    ]));
-  }
-
-  /// Same card treatment as [_build3DCard], but for destinations that don't
-  /// have a dedicated illustration asset yet -- uses a large Icon instead.
-  Widget _build3DCardIcon(String title, String sub, IconData icon, bool isRight) {
-    return SizedBox(height: 150, child: Stack(clipBehavior: Clip.none, children: [
-      Positioned(top: 15, left: -12, right: 12, bottom: -12, child: Container(decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)))),
-      Container(width: double.infinity, decoration: BoxDecoration(color: const Color(0xFF2A1B38), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.black, width: 2)), padding: EdgeInsets.only(left: isRight ? 24 : 140, right: isRight ? 140 : 24, top: 25), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)), Text(sub, style: TextStyle(color: Colors.white.withOpacity(0.8), fontSize: 11))])),
-      Positioned(left: isRight ? null : -25, right: isRight ? -25 : null, top: -35, bottom: -5, child: Center(child: Icon(icon, size: 90, color: Colors.white.withOpacity(0.85)))),
     ]));
   }
 }

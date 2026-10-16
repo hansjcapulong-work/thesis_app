@@ -1,15 +1,11 @@
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
-import 'screens/introduction_screen.dart';
-import 'widgets/floating_goal_bubble.dart';
-import 'data/bubble_visibility.dart';
-import 'screens/live_conversation_screen.dart';
-import 'screens/history_screen.dart';
+import 'screens/app_entry_point.dart';
+import 'utils/route_observer.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
-  bubbleVisible.value = false; // never show on app cold start until logged into the dashboard
   runApp(const CommunicationApp());
 }
 
@@ -33,15 +29,8 @@ class CommunicationApp extends StatelessWidget {
           ),
         ),
       ),
-      builder: (context, child) {
-        return Stack(
-          children: [
-            child!,
-            const FloatingGoalBubble(),
-          ],
-        );
-      },
-      home: const IntroductionScreen(),
+      navigatorObservers: [routeObserver],
+      home: const AppEntryPoint(),
     );
   }
 }

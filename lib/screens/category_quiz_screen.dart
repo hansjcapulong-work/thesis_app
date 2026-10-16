@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import '../data/asl_words.dart';
 import '../data/progress_service.dart';
 import '../data/daily_activity_service.dart';
-import '../widgets/skeletal_gesture_viewer.dart';
+import '../widgets/avatar_gesture_viewer.dart';
 
 class CategoryQuizScreen extends StatefulWidget {
   final String category;
@@ -23,11 +23,19 @@ class _CategoryQuizScreenState extends State<CategoryQuizScreen> {
   bool _quizFinished = false;
   List<String> _currentOptions = [];
 
+  // Bumped by the replay button and folded into the gesture's
+  // sequenceKey below, so tapping replay re-plays the current clip
+  // without remounting AvatarGestureViewer (which would reload the
+  // whole GLB). Reset to 0 whenever the question changes.
+  int _replayCount = 0;
+
   @override
   void initState() {
     super.initState();
-    _questions = List.of(wordsInCategory(widget.category))..shuffle();
-    _generateOptions();
+    // Only quiz on words that actually have a sign to show -- a
+    // "which word is this?" question is meaningless without a gesture.
+    _questions = List.of(wordsInCategory(widget.category).where((w) => w.hasSign))..shuffle();
+    if (_questions.isNotEmpty) _generateOptions();
     _stopwatch.start();
   }
 
@@ -79,6 +87,7 @@ class _CategoryQuizScreenState extends State<CategoryQuizScreen> {
         _currentIndex++;
         _answered = false;
         _selectedAnswer = null;
+        _replayCount = 0;
       });
       _generateOptions();
     } else {
@@ -106,17 +115,24 @@ class _CategoryQuizScreenState extends State<CategoryQuizScreen> {
       _answered = false;
       _selectedAnswer = null;
       _quizFinished = false;
+      _replayCount = 0;
     });
     _generateOptions();
   }
 
-  /// Builds the gesture the player has to identify. Falls back to a
-  /// placeholder for any word that doesn't have a recorded landmark
-  /// asset yet.
+  /// Builds the gesture the player has to identify. Questions are
+  /// pre-filtered to words with a sign (see initState), so this should
+  /// always have an animation to show -- the placeholder below is just
+  /// a defensive fallback.
+  ///
+  /// Deliberately no widget Key here: AvatarGestureViewer says not to
+  /// re-key it per word, since that forces a full GLB reload. Instead
+  /// we keep the same instance for the whole quiz and change
+  /// sequenceKey per question, which just replays the new clip.
   Widget _buildQuestionGesture() {
-    final asset = _questions[_currentIndex].landmarksAsset;
+    final word = _questions[_currentIndex];
 
-    if (asset == null) {
+    if (!word.hasSign) {
       return Container(
         decoration: BoxDecoration(
           color: Colors.grey[200],
@@ -134,17 +150,41 @@ class _CategoryQuizScreenState extends State<CategoryQuizScreen> {
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(16),
-      child: SkeletalGestureViewer(
-        // Re-keying on the asset path remounts the widget for each new
-        // question, restarting the animation from the beginning.
-        key: ValueKey(asset),
-        assetPath: asset,
+      child: AvatarGestureViewer(
+        animationName: word.signAnimation,
+        durationMs: word.signDurationMs,
+        // Changing question moves to a new word; tapping replay bumps
+        // _replayCount -- either way this key changes and the clip
+        // replays in place.
+        sequenceKey: '${word.word}_$_replayCount',
       ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_questions.isEmpty) {
+      return Scaffold(
+        backgroundColor: Colors.white,
+        appBar: AppBar(
+          backgroundColor: Colors.white,
+          elevation: 0,
+          iconTheme: const IconThemeData(color: Color(0xFF2A1B38)),
+          title: Text('${widget.category} Quiz', style: const TextStyle(color: Color(0xFF2A1B38), fontWeight: FontWeight.bold)),
+        ),
+        body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(30),
+            child: Text(
+              'No signs are ready to quiz on yet for this collection.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey),
+            ),
+          ),
+        ),
+      );
+    }
+
     if (_quizFinished) {
       final scorePercent = _correctCount / _questions.length;
       final passed = scorePercent >= 0.7;
@@ -212,7 +252,13 @@ class _CategoryQuizScreenState extends State<CategoryQuizScreen> {
         child: Column(
           children: [
             SizedBox(height: 220, child: _buildQuestionGesture()),
-            const SizedBox(height: 24),
+            if (_questions[_currentIndex].hasSign)
+              TextButton.icon(
+                onPressed: () => setState(() => _replayCount++),
+                icon: const Icon(Icons.replay, size: 18, color: Color(0xFF2A1B38)),
+                label: const Text('Replay Sign', style: TextStyle(color: Color(0xFF2A1B38), fontWeight: FontWeight.w600)),
+              ),
+            const SizedBox(height: 8),
             const Text('Which word is this sign?', style: TextStyle(color: Colors.grey, fontSize: 14)),
             const SizedBox(height: 16),
             ..._currentOptions.map((option) {

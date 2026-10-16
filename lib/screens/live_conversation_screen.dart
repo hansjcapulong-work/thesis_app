@@ -1,8 +1,7 @@
 import 'dart:io' show Platform;
-import 'dart:typed_data' show Uint8List;
+import 'dart:math' as math;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:hand_landmarker/hand_landmarker.dart';
 import '../data/asl_words.dart';
 import '../services/gesture_recognition_service.dart';
@@ -10,11 +9,18 @@ import '../services/gloss_matcher.dart';
 import '../services/tts_service.dart';
 import '../services/whisper_service.dart';
 import '../services/conversation_history_service.dart';
-import '../widgets/skeletal_gesture_viewer.dart';
+import '../services/avatar_preference_service.dart';
+import '../data/avatar_options.dart';
+import '../widgets/avatar_gesture_viewer.dart';
 
 const _purple = Color(0xFF2A1B38);
 
 enum _EntrySource { signed, spoken }
+
+/// Which of the two media cards currently gets the large slot in the
+/// landscape layout. The other one is shown small beside it. Tapping the
+/// expand icon on the small card swaps them.
+enum _FocusedCard { camera, avatar }
 
 class _ConversationEntry {
   final _EntrySource source;
@@ -31,6 +37,13 @@ class LiveConversationScreen extends StatefulWidget {
 }
 
 class _LiveConversationScreenState extends State<LiveConversationScreen> {
+  // TEMP: flip to true to re-enable camera-based gesture recognition.
+  // While false, the camera and HandLandmarkerPlugin never
+  // initialize -- no camera permission prompt, no native processing --
+  // and the viewfinder box just shows a placeholder. Speech-to-gesture is
+  // completely unaffected by this flag.
+  static const bool _kEnableGestureRecognition = true;
+
   // --- Gesture-to-speech side (camera) ---
   CameraController? _controller;
   HandLandmarkerPlugin? _plugin;
@@ -40,18 +53,7 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
   bool _modelLoaded = false;
   String? _modelStatusMessage;
   int _handsVisible = 0;
-
-  // Pose landmarker: runs alongside the hand landmarker to supply the
-  // shoulder-anchored body pose GestureRecognitionService needs for
-  // normalization (see the note on addFrame). ML Kit's pose is async per
-  // frame, so we cache the latest result and hand whatever we have to
-  // addFrame each time a hand-landmark frame comes in, rather than trying
-  // to hard-sync the two streams.
-  PoseDetector? _poseDetector;
-  List<List<double>>? _latestPoseLandmarks;
-  bool _processingPoseFrame = false;
   bool _processingHandFrame = false;
-  String? _poseErrorMessage;
   String? _lastSegmentDebug;
 
   final TtsService _tts = TtsService();
@@ -62,6 +64,12 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
   bool _isTranscribing = false; // true while waiting on the server after Stop is tapped
   List<ASLWord> _matchedWords = [];
   int _currentWordIndex = 0;
+
+  // --- Avatar chosen in Settings ---
+  // Defaults until the saved preference has been read (a few ms); the viewer
+  // is only built after speech is matched, so the user never sees the default
+  // flash before their own avatar.
+  AvatarOption _avatar = avatarById(null);
 
   // --- Shared conversation history ---
   final List<_ConversationEntry> _conversation = [];
@@ -78,6 +86,20 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
   static const double _gap = 16.0;
   static const double _minTranscribeHeight = 160.0;
   static const double _minTopHeight = 160.0; // min combined height for input+ASL box
+
+  // --- Landscape layout state ---
+  // Which card owns the big slot. Camera by default, matching the mockup.
+  _FocusedCard _focusedCard = _FocusedCard.camera;
+  // Width of the small card as a fraction of the media area. Driven by the
+  // drag divider that sits between the two cards.
+  double _smallCardFraction = 0.28;
+  static const double _minSmallCardFraction = 0.16;
+  static const double _maxSmallCardFraction = 0.48;
+  // Width (px) of the side transcript drawer. Null until first layout.
+  double? _transcriptWidth;
+  bool _transcriptOpen = true;
+  static const double _minTranscriptWidth = 200.0;
+  static const double _minMediaAreaWidth = 280.0;
 
   ASLWord? get _currentWord =>
       _matchedWords.isNotEmpty && _currentWordIndex < _matchedWords.length
@@ -115,7 +137,19 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
       });
     };
     _tts.init();
-    _initCamera();
+
+    AvatarPreferenceService.load().then((option) {
+      if (!mounted) return;
+      setState(() => _avatar = option);
+    });
+
+    // Gesture recognition (camera + hand landmarker) only spins up
+    // when explicitly enabled. Leave this off to test speech-to-gesture
+    // in isolation without a camera permission prompt or the native
+    // pipeline running in the background.
+    if (_kEnableGestureRecognition) {
+      _initCamera();
+    }
   }
 
   void _appendEntry(_EntrySource source, String text) {
@@ -159,16 +193,12 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
         orElse: () => cameras.first,
       );
 
-      // Reverted from ImageFormatGroup.nv21: it fixed ML Kit's pose
-      // converter (no more IllegalArgumentException), but collapsed the
-      // Android CameraImage to a single plane on this device, which broke
-      // hand_landmarker -- its native code indexes into 3 separate Y/U/V
-      // planes and threw `RangeError: Only valid value is 0: 1` the moment
-      // plane[1] didn't exist. Both consumers share one camera stream, so
-      // the format has to work for both: staying on the standard 3-plane
-      // yuv420 (what hand_landmarker expects) and making the manual NV21
-      // conversion below correct is the only option that doesn't break one
-      // to fix the other.
+      // yuv420 is what hand_landmarker's native code expects on Android
+      // (it indexes into 3 separate Y/U/V planes); iOS delivers a single
+      // BGRA8888 plane instead. This used to also need to satisfy ML
+      // Kit's pose detector on the same stream, but the current model
+      // (sign_language_model.tflite) is hands-only, so hand_landmarker
+      // is the only consumer now.
       _controller = CameraController(
         camera,
         ResolutionPreset.medium,
@@ -180,10 +210,6 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
         numHands: 2,
         minHandDetectionConfidence: 0.6,
         delegate: HandLandmarkerDelegate.gpu,
-      );
-
-      _poseDetector = PoseDetector(
-        options: PoseDetectorOptions(mode: PoseDetectionMode.stream),
       );
 
       await _controller!.initialize();
@@ -202,9 +228,9 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
     if (_plugin == null || _controller == null) return;
     // hand_landmarker's processFrame is fire-and-forget into a native
     // background thread with no returned Future, so there's nothing to
-    // await here directly. Instead this is guarded the same way pose is:
-    // don't dispatch a new frame until the previous one's result has come
-    // back through landmarkStream (see _onHandsDetected). Camera frames
+    // await here directly. Instead this is guarded so a new frame isn't
+    // dispatched until the previous one's result has come back through
+    // landmarkStream (see _onHandsDetected). Camera frames
     // can arrive faster than native inference completes, and calling
     // processFrame again before that happens is what produced the
     // "Tensors are designed for single writes" warning -- overlapping
@@ -218,229 +244,14 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
         debugPrint('Error processing camera frame: $e');
       }
     }
-    _processPoseFrame(image);
   }
 
-  /// Runs ML Kit pose detection on the current frame and caches the
-  /// result. Guarded by [_processingPoseFrame] so frames don't queue up
-  /// faster than detection can keep up -- if a pose result is still
-  /// pending, this frame is skipped and the previous cached pose (if any)
-  /// keeps being used until a fresher one lands.
-  Future<void> _processPoseFrame(CameraImage image) async {
-    final detector = _poseDetector;
-    final controller = _controller;
-    if (detector == null || controller == null || _processingPoseFrame) return;
-
-    _processingPoseFrame = true;
-    try {
-      final inputImage = _inputImageFromCameraImage(image, controller.description);
-      if (inputImage == null) return;
-
-      final poses = await detector.processImage(inputImage);
-      if (poses.isEmpty) return;
-
-      // TODO(verify): ML Kit's Pose landmarks come back in image pixel
-      // coordinates, while hand_landmarker's Hand.landmarks appear to be
-      // normalized 0..1 (see _onHandsDetected). Dividing by image
-      // width/height here is an assumption to line the two coordinate
-      // spaces up before they both feed the same shoulder-relative
-      // normalization in GestureRecognitionService -- confirm against a
-      // real frame (e.g. log both sources side-by-side) rather than
-      // trusting this blind, since a mismatch here would silently degrade
-      // recognition rather than crash.
-      final pose = poses.first;
-      final width = image.width.toDouble();
-      final height = image.height.toDouble();
-
-      // Order here must match the 33-point BlazePose/MediaPipe topology
-      // GestureRecognitionService expects (indices 0-32, shoulders at
-      // 11/12 -- see _leftShoulderIdx/_rightShoulderIdx). This mapping
-      // assumes google_mlkit_pose_detection's PoseLandmarkType names below
-      // match your installed package version exactly -- enum member names
-      // have shifted between versions before (e.g. mouth landmarks). If
-      // this file fails to compile on "leftMouth"/"rightMouth", check
-      // PoseLandmarkType's actual members for your pinned version and
-      // adjust here rather than guessing.
-      final ordered = <PoseLandmarkType>[
-        PoseLandmarkType.nose,
-        PoseLandmarkType.leftEyeInner, PoseLandmarkType.leftEye, PoseLandmarkType.leftEyeOuter,
-        PoseLandmarkType.rightEyeInner, PoseLandmarkType.rightEye, PoseLandmarkType.rightEyeOuter,
-        PoseLandmarkType.leftEar, PoseLandmarkType.rightEar,
-        PoseLandmarkType.leftMouth, PoseLandmarkType.rightMouth,
-        PoseLandmarkType.leftShoulder, PoseLandmarkType.rightShoulder,
-        PoseLandmarkType.leftElbow, PoseLandmarkType.rightElbow,
-        PoseLandmarkType.leftWrist, PoseLandmarkType.rightWrist,
-        PoseLandmarkType.leftPinky, PoseLandmarkType.rightPinky,
-        PoseLandmarkType.leftIndex, PoseLandmarkType.rightIndex,
-        PoseLandmarkType.leftThumb, PoseLandmarkType.rightThumb,
-        PoseLandmarkType.leftHip, PoseLandmarkType.rightHip,
-        PoseLandmarkType.leftKnee, PoseLandmarkType.rightKnee,
-        PoseLandmarkType.leftAnkle, PoseLandmarkType.rightAnkle,
-        PoseLandmarkType.leftHeel, PoseLandmarkType.rightHeel,
-        PoseLandmarkType.leftFootIndex, PoseLandmarkType.rightFootIndex,
-      ];
-
-      final landmarks = ordered.map((type) {
-        final lm = pose.landmarks[type];
-        if (lm == null) return [0.0, 0.0, 0.0];
-        return [lm.x / width, lm.y / height, lm.z];
-      }).toList();
-
-      if (!mounted) return;
-      _latestPoseLandmarks = landmarks;
-      if (_poseErrorMessage != null) setState(() => _poseErrorMessage = null);
-    } catch (e) {
-      debugPrint('Error processing pose frame: $e');
-      // Surfaced on-screen (see the debug strip) rather than only in
-      // debugPrint, so this doesn't require pulling logcat every time to
-      // see what's actually failing. Throttled to avoid a setState on
-      // every single failed frame (which would otherwise fire at camera
-      // frame rate while pose stays broken).
-      if (mounted && _poseErrorMessage != e.toString()) {
-        setState(() => _poseErrorMessage = e.toString());
-      }
-    } finally {
-      _processingPoseFrame = false;
-    }
-  }
-
-  /// Standard camera_image -> InputImage conversion for ML Kit. Android's
-  /// default camera format (`yuv420`, same format hand_landmarker consumes)
-  /// delivers 3 SEPARATE planes (Y, U, V) with their own row strides --
-  /// concatenating those byte arrays directly does NOT produce valid NV21,
-  /// since NV21 requires U/V interleaved in a specific order. This does a
-  /// real conversion instead. iOS delivers BGRA8888 as a single plane
-  /// already, no conversion needed.
-  InputImage? _inputImageFromCameraImage(CameraImage image, CameraDescription camera) {
-    final rotation = InputImageRotationValue.fromRawValue(camera.sensorOrientation);
-    if (rotation == null) return null;
-
-    if (Platform.isAndroid) {
-      final nv21 = _yuv420ToNv21(image);
-      if (nv21 == null) return null;
-
-      return InputImage.fromBytes(
-        bytes: nv21,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: InputImageFormat.nv21,
-          bytesPerRow: image.width, // NV21 Y-plane row stride == width once converted
-        ),
-      );
-    }
-
-    // iOS: single BGRA8888 plane.
-    final plane = image.planes.first;
-    return InputImage.fromBytes(
-      bytes: plane.bytes,
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: InputImageFormat.bgra8888,
-        bytesPerRow: plane.bytesPerRow,
-      ),
-    );
-  }
-
-  /// Converts a 3-plane YUV_420_888 CameraImage (Android's default, and
-  /// what hand_landmarker expects to keep receiving) into a proper NV21
-  /// byte buffer for ML Kit: full-resolution Y plane, followed by
-  /// half-resolution interleaved VU bytes. Row strides and pixel strides
-  /// on the U/V planes are respected rather than assumed, since some
-  /// devices pad rows or interleave U/V with a pixel stride of 2 already.
-  ///
-  /// Returns null if the image doesn't have the expected 3-plane shape
-  /// (shouldn't happen with the default Android camera format, but safer
-  /// than crashing if a device does something unexpected).
-  Uint8List? _yuv420ToNv21(CameraImage image) {
-    if (image.planes.length < 3) {
-      throw StateError(
-        'Expected 3 camera planes (Y/U/V), got ${image.planes.length}. '
-            'Camera format/device isn\'t giving the standard yuv420 layout '
-            'this conversion assumes.',
-      );
-    }
-
-    final width = image.width;
-    final height = image.height;
-    final yPlane = image.planes[0];
-    final uPlane = image.planes[1];
-    final vPlane = image.planes[2];
-
-    if (width.isOdd || height.isOdd) {
-      throw StateError(
-        'Odd camera dimensions ${width}x$height -- 4:2:0 chroma math '
-            '(width/2, height/2) assumes even dimensions.',
-      );
-    }
-
-    final ySize = width * height;
-    final uvSize = width * height ~/ 2;
-    final nv21 = Uint8List(ySize + uvSize);
-
-    // --- Y plane: copy row by row, stripping any row-stride padding. ---
-    var pos = 0;
-    for (int row = 0; row < height; row++) {
-      final rowStart = row * yPlane.bytesPerRow;
-      if (rowStart + width > yPlane.bytes.length) {
-        throw StateError(
-          'Y plane too small: row=$row bytesPerRow=${yPlane.bytesPerRow} '
-              'width=$width planeLength=${yPlane.bytes.length}. '
-              'yPlane.bytesPerRow may be misreported on this device.',
-        );
-      }
-      nv21.setRange(pos, pos + width, yPlane.bytes, rowStart);
-      pos += width;
-    }
-
-    // --- Interleave V and U into NV21's VU order. ---
-    // NV21 wants one V byte then one U byte per 2x2 pixel block, i.e.
-    // (width/2 * height/2) VU pairs. U and V planes are typically the
-    // same dimensions with their own row/pixel strides on Android.
-    final uvRowStride = vPlane.bytesPerRow;
-    final uvPixelStride = vPlane.bytesPerPixel;
-    final uPixelStride = uPlane.bytesPerPixel;
-    if (uvPixelStride == null || uPixelStride == null) {
-      throw StateError(
-        'U/V plane.bytesPerPixel is null on this device (U=$uPixelStride '
-            'V=$uvPixelStride) -- can\'t safely assume a pixel stride '
-            '(1 = fully planar, 2 = semi-planar/interleaved) without it, '
-            'since guessing wrong silently corrupts the image instead of '
-            'throwing.',
-      );
-    }
-    final chromaHeight = height ~/ 2;
-    final chromaWidth = width ~/ 2;
-
-    for (int row = 0; row < chromaHeight; row++) {
-      for (int col = 0; col < chromaWidth; col++) {
-        final vIndex = row * uvRowStride + col * uvPixelStride;
-        final uIndex = row * uPlane.bytesPerRow + col * uPixelStride;
-        if (vIndex >= vPlane.bytes.length || uIndex >= uPlane.bytes.length) {
-          throw StateError(
-            'Chroma index out of range at row=$row col=$col: '
-                'vIndex=$vIndex/${vPlane.bytes.length} '
-                'uIndex=$uIndex/${uPlane.bytes.length} '
-                '(uvRowStride=$uvRowStride uvPixelStride=$uvPixelStride '
-                'uBytesPerRow=${uPlane.bytesPerRow}). Stride assumptions '
-                'don\'t match this device\'s actual plane layout.',
-          );
-        }
-        nv21[pos++] = vPlane.bytes[vIndex];
-        nv21[pos++] = uPlane.bytes[uIndex];
-      }
-    }
-
-    if (pos != nv21.length) {
-      throw StateError('NV21 buffer size mismatch: wrote $pos, expected ${nv21.length}.');
-    }
-
-    return nv21;
-  }
-
-  /// NOTE: position-based left/right fallback -- see earlier flag about
-  /// this plugin's handedness labeling. Swap if hands seem mislabeled.
+  /// Front camera preview is typically mirrored, so a hand appearing on
+  /// the LEFT side of the screen (smaller x) is usually the signer's
+  /// actual RIGHT hand, and vice versa -- verified against real predictions
+  /// in the gesture test screen. If sign accuracy seems mirrored later
+  /// (e.g. after a plugin/platform change), that's the first thing to
+  /// re-check, not this logic.
   void _onHandsDetected(List<Hand> hands) {
     if (!mounted) return;
     _processingHandFrame = false; // previous frame's result has landed
@@ -450,22 +261,26 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
     List<List<double>>? rightLandmarks;
 
     if (hands.length == 1) {
-      leftLandmarks = hands.first.landmarks.map((l) => [l.x, l.y, 0.0]).toList();
+      final coords = hands.first.landmarks.map((l) => [l.x, l.y, l.z]).toList();
+      final wristX = hands.first.landmarks[0].x; // landmark 0 = wrist
+
+      if (wristX < 0.5) {
+        rightLandmarks = coords;
+      } else {
+        leftLandmarks = coords;
+      }
     } else if (hands.length >= 2) {
       final sorted = List<Hand>.from(hands)
         ..sort((a, b) => a.landmarks[0].x.compareTo(b.landmarks[0].x));
-      leftLandmarks = sorted[0].landmarks.map((l) => [l.x, l.y, 0.0]).toList();
-      rightLandmarks = sorted[1].landmarks.map((l) => [l.x, l.y, 0.0]).toList();
+      // smaller x = actual RIGHT hand, larger x = actual LEFT hand
+      // (front camera mirroring) -- confirmed via the single-hand case.
+      rightLandmarks = sorted[0].landmarks.map((l) => [l.x, l.y, l.z]).toList();
+      leftLandmarks = sorted[1].landmarks.map((l) => [l.x, l.y, l.z]).toList();
     }
 
-    // Pose landmarks come from the separate ML Kit pose stream, cached in
-    // _latestPoseLandmarks each time a new pose result lands (see
-    // _processPoseFrame). If no pose has been detected yet -- e.g. the
-    // detector hasn't returned a first result, or the person is out of
-    // frame -- this stays null and the service safely drops the frame
-    // rather than corrupting normalization.
+    // The current model (sign_language_model.tflite) is hands-only --
+    // no pose input needed at all.
     _gestureService.addFrame(
-      poseLandmarks: _latestPoseLandmarks,
       leftHandLandmarks: leftLandmarks,
       rightHandLandmarks: rightLandmarks,
     );
@@ -517,16 +332,52 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
     }
   }
 
-  void _advanceToNextWord() {
-    if (_currentWordIndex < _matchedWords.length - 1) {
-      setState(() => _currentWordIndex++);
+  /// Short beat between two fingerspelled words (or between a fingerspelled
+  /// word and a normal sign) so the letters of one word don't run into the
+  /// next -- otherwise "HI" then "JO" reads as "HIJO".
+  static const Duration _spellingWordGap = Duration(milliseconds: 300);
+
+  Future<void> _advanceToNextWord() async {
+    if (_currentWordIndex >= _matchedWords.length - 1) return;
+
+    final list = _matchedWords;
+    final current = _currentWord;
+    final next = list[_currentWordIndex + 1];
+
+    final leavingSpelledWord = current != null &&
+        current.isFingerspelled &&
+        (!next.isFingerspelled || next.letterIndex == 0);
+
+    if (leavingSpelledWord) {
+      await Future.delayed(_spellingWordGap);
+      // The user may have left the screen or started a new recording
+      // during the pause; if so this advance is stale.
+      if (!mounted || !identical(list, _matchedWords)) return;
     }
+
+    setState(() => _currentWordIndex++);
   }
 
   // ─────────────────────────── UI ───────────────────────────
 
   @override
   Widget build(BuildContext context) {
+    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+
+    // Landscape drops the AppBar entirely: horizontal space is scarce, so the
+    // back affordance becomes a floating button over the media area instead.
+    if (isLandscape) {
+      return Scaffold(
+        backgroundColor: Colors.white,
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
+            child: LayoutBuilder(builder: _buildLandscapeBody),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
@@ -581,8 +432,448 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
     );
   }
 
+  // ─────────────────────────── Landscape layout ───────────────────────────
+
+  /// Landscape root: [ media area | drag handle | transcript drawer ].
+  ///
+  /// The media area holds the two cards side by side, separated by their own
+  /// drag divider, plus the floating back button and the Press to Speak
+  /// control. The transcript drawer can be dragged narrower/wider or pulled
+  /// closed entirely, in which case a thin tab is left on the right edge.
+  Widget _buildLandscapeBody(BuildContext context, BoxConstraints constraints) {
+    final totalWidth = constraints.maxWidth;
+
+    // Upper bound respects both a hard cap (45% of the screen) and the
+    // minimum breathing room the media area needs. math.max guards the case
+    // where the screen is too narrow to satisfy both.
+    final maxTranscriptWidth = math.max(
+      _minTranscriptWidth,
+      math.min(totalWidth * 0.45, totalWidth - _minMediaAreaWidth),
+    );
+
+    _transcriptWidth ??=
+        (totalWidth * 0.28).clamp(_minTranscriptWidth, maxTranscriptWidth);
+    final transcriptWidth =
+    _transcriptWidth!.clamp(_minTranscriptWidth, maxTranscriptWidth);
+
+    // Closed drawer still leaves room for the pull tab.
+    const tabWidth = 28.0;
+    // Tighter than the portrait _gap -- every px of media width counts here.
+    const landscapeGap = 8.0;
+    final drawerWidth = _transcriptOpen ? transcriptWidth : tabWidth;
+    final mediaWidth = totalWidth - drawerWidth - landscapeGap;
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(width: mediaWidth, child: _buildMediaArea()),
+        const SizedBox(width: landscapeGap),
+        SizedBox(
+          width: drawerWidth,
+          child: _transcriptOpen
+              ? _buildTranscriptDrawer(maxTranscriptWidth)
+              : _buildTranscriptTab(),
+        ),
+      ],
+    );
+  }
+
+  /// The two media cards plus the mic control.
+  ///
+  /// In landscape, height is the scarce axis and width is not, so the back
+  /// button lives in a narrow left rail rather than eating a horizontal band
+  /// across the top, and both cards stretch to the full available height.
+  Widget _buildMediaArea() {
+    const railWidth = 40.0;
+    const controlsHeight = 52.0;
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SizedBox(
+          width: railWidth,
+          child: Column(
+            children: [
+              Material(
+                color: _purple,
+                borderRadius: BorderRadius.circular(10),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  onTap: () => Navigator.of(context).maybePop(),
+                  child: const Padding(
+                    padding: EdgeInsets.all(7),
+                    child: Icon(Icons.arrow_back_ios_new, color: Colors.white, size: 16),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: Column(
+            children: [
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final cardsWidth = constraints.maxWidth;
+                    final smallWidth = (cardsWidth * _smallCardFraction).clamp(
+                      cardsWidth * _minSmallCardFraction,
+                      cardsWidth * _maxSmallCardFraction,
+                    );
+                    final cameraIsBig = _focusedCard == _FocusedCard.camera;
+
+                    final smallCard = _cardShell(
+                      isExpanded: false,
+                      onToggle: () => setState(
+                            () => _focusedCard =
+                        cameraIsBig ? _FocusedCard.avatar : _FocusedCard.camera,
+                      ),
+                      child: cameraIsBig
+                          ? _buildAslBox(compact: true)
+                          : _buildCameraViewfinder(compact: true),
+                    );
+
+                    final bigCard = _cardShell(
+                      isExpanded: true,
+                      onToggle: () => setState(
+                            () => _focusedCard =
+                        cameraIsBig ? _FocusedCard.avatar : _FocusedCard.camera,
+                      ),
+                      child: cameraIsBig ? _buildCameraViewfinder() : _buildAslBox(),
+                    );
+
+                    return Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        SizedBox(width: smallWidth, child: smallCard),
+                        // Drag divider: widens the small card, shrinks the big one.
+                        _buildVerticalDivider(cardsWidth),
+                        Expanded(child: bigCard),
+                      ],
+                    );
+                  },
+                ),
+              ),
+              SizedBox(
+                height: controlsHeight,
+                child: Center(child: _buildMicControl(wide: true)),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Grab bar between the two cards.
+  Widget _buildVerticalDivider(double cardsWidth) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeLeftRight,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragUpdate: (details) {
+          setState(() {
+            final next = _smallCardFraction + details.delta.dx / cardsWidth;
+            _smallCardFraction =
+                next.clamp(_minSmallCardFraction, _maxSmallCardFraction);
+          });
+        },
+        child: SizedBox(
+          width: _gap,
+          child: Center(
+            child: Container(
+              width: 4,
+              height: 44,
+              decoration: BoxDecoration(
+                color: _purple.withOpacity(0.35),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Rounded frame + expand/collapse toggle shared by both media cards.
+  Widget _cardShell({
+    required Widget child,
+    required bool isExpanded,
+    required VoidCallback onToggle,
+  }) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        child,
+        Positioned(
+          top: 8,
+          right: 8,
+          child: Material(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(8),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: onToggle,
+              child: Padding(
+                padding: const EdgeInsets.all(5),
+                child: Icon(
+                  isExpanded ? Icons.close_fullscreen : Icons.open_in_full,
+                  size: 16,
+                  color: _purple,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Side transcript drawer. Horizontal drag on its left edge resizes it;
+  /// dragging it past the minimum (or tapping the chevron) closes it.
+  Widget _buildTranscriptDrawer(double maxTranscriptWidth) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: _purple,
+        borderRadius: BorderRadius.horizontal(
+          left: Radius.circular(24),
+          right: Radius.circular(16),
+        ),
+      ),
+      child: Row(
+        children: [
+          MouseRegion(
+            cursor: SystemMouseCursors.resizeLeftRight,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (details) {
+                setState(() {
+                  // Dragging left (negative dx) should grow the drawer.
+                  final next = (_transcriptWidth ?? maxTranscriptWidth) - details.delta.dx;
+                  if (next < _minTranscriptWidth - 40) {
+                    _transcriptOpen = false;
+                    _transcriptWidth = _minTranscriptWidth;
+                  } else {
+                    _transcriptWidth =
+                        next.clamp(_minTranscriptWidth, maxTranscriptWidth);
+                  }
+                });
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                color: Colors.transparent,
+                child: Center(
+                  child: Container(
+                    width: 4,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      color: Colors.white38,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: Column(
+              children: [
+                // Compact header: plain InkWells instead of IconButtons,
+                // which carry 48px tap padding each and were squeezing the
+                // title into an ellipsis. Title also shortens when narrow.
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 8, 8, 2),
+                  child: LayoutBuilder(
+                    builder: (context, constraints) => Row(
+                      children: [
+                        InkWell(
+                          borderRadius: BorderRadius.circular(6),
+                          onTap: () => setState(() => _isMuted = !_isMuted),
+                          child: Padding(
+                            padding: const EdgeInsets.all(4),
+                            child: Icon(
+                              _isMuted ? Icons.volume_off : Icons.volume_up,
+                              color: Colors.white70,
+                              size: 18,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            constraints.maxWidth < 260 ? 'Transcript' : 'Transcribe Conversation',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(6),
+                          onTap: () => setState(() => _transcriptOpen = false),
+                          child: const Padding(
+                            padding: EdgeInsets.all(4),
+                            child: Icon(Icons.chevron_right, color: Colors.white70, size: 18),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: _conversation.isEmpty
+                      ? const Center(
+                    child: Text(
+                      'No conversation yet.',
+                      style: TextStyle(color: Colors.white38, fontSize: 13),
+                    ),
+                  )
+                      : LayoutBuilder(
+                    builder: (context, constraints) => ListView.builder(
+                      controller: _chatScrollController,
+                      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                      itemCount: _conversation.length,
+                      itemBuilder: (context, index) => _buildChatBubble(
+                        _conversation[index],
+                        maxWidth: constraints.maxWidth * 0.9,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Collapsed drawer: a thin tab to pull the transcript back out.
+  Widget _buildTranscriptTab() {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => setState(() => _transcriptOpen = true),
+      onHorizontalDragUpdate: (details) {
+        if (details.delta.dx < -2) setState(() => _transcriptOpen = true);
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: _purple,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: const Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.chevron_left, color: Colors.white70, size: 20),
+            SizedBox(height: 8),
+            RotatedBox(
+              quarterTurns: 3,
+              child: Text(
+                'Transcript',
+                style: TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Mic button. Shared shape between orientations; [wide] gives it the
+  /// pill treatment the landscape mockup uses.
+  Widget _buildMicControl({bool wide = false}) {
+    if (_isTranscribing) {
+      // Landscape sits on white, portrait sits on the purple panel.
+      return SizedBox(
+        height: 28,
+        width: 28,
+        child: CircularProgressIndicator(
+          color: wide ? _purple : Colors.white,
+          strokeWidth: 3,
+        ),
+      );
+    }
+
+    final padding = wide
+        ? const EdgeInsets.symmetric(horizontal: 28, vertical: 10)
+        : const EdgeInsets.symmetric(horizontal: 24, vertical: 12);
+
+    if (_isRecording) {
+      return _constrainWidth(
+        wide,
+        ElevatedButton.icon(
+          onPressed: _stopListening,
+          icon: const Icon(Icons.stop),
+          label: const Text('Stop'),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.red.shade400,
+            foregroundColor: Colors.white,
+            padding: padding,
+            minimumSize: wide ? Size.zero : null,
+            tapTargetSize: wide ? MaterialTapTargetSize.shrinkWrap : null,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+          ),
+        ),
+      );
+    }
+
+    return _constrainWidth(
+      wide,
+      ElevatedButton.icon(
+        onPressed: _startListening,
+        icon: const Icon(Icons.mic),
+        label: Text(wide ? 'Press to Speak' : 'Start Speaking'),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: wide ? _purple : Colors.white,
+          foregroundColor: wide ? Colors.white : _purple,
+          padding: padding,
+          minimumSize: wide ? Size.zero : null,
+          tapTargetSize: wide ? MaterialTapTargetSize.shrinkWrap : null,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+        ),
+      ),
+    );
+  }
+
+  /// A global ElevatedButton theme with a `minimumSize`/`fixedSize` of
+  /// double.infinity will stretch the mic button across the whole media
+  /// column, which is exactly the vertical/horizontal space landscape can't
+  /// spare. Capping the width here keeps it a pill regardless of the theme.
+  Widget _constrainWidth(bool wide, Widget child) {
+    if (!wide) return child;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 240),
+      child: child,
+    );
+  }
+
   /// Camera preview with corner-bracket viewfinder framing.
-  Widget _buildCameraViewfinder() {
+  Widget _buildCameraViewfinder({bool compact = false}) {
+    // Gesture recognition disabled: skip the camera UI entirely (no
+    // permission prompt, no spinner that would otherwise spin forever
+    // since _initCamera() never runs) and show a plain placeholder.
+    if (!_kEnableGestureRecognition) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: Container(
+          color: Colors.grey.shade200,
+          child: const Center(
+            child: Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'Gesture recognition disabled for testing',
+                style: TextStyle(color: Colors.black45, fontSize: 12, fontWeight: FontWeight.w600),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: Container(
@@ -600,15 +891,21 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
             else if (!_cameraInitialized)
               const Center(child: CircularProgressIndicator(color: _purple))
             else
-              LayoutBuilder(
-                builder: (context, constraints) {
+              Builder(
+                builder: (context) {
                   final previewSize = _controller!.value.previewSize!;
+                  // previewSize is reported in the sensor's own orientation,
+                  // which is landscape on virtually every device. In a
+                  // portrait layout we swap the axes; in landscape we use it
+                  // as-is, otherwise the preview comes out rotated 90°.
+                  final isLandscape =
+                      MediaQuery.of(context).orientation == Orientation.landscape;
                   return ClipRect(
                     child: FittedBox(
                       fit: BoxFit.cover,
                       child: SizedBox(
-                        width: previewSize.height,
-                        height: previewSize.width,
+                        width: isLandscape ? previewSize.width : previewSize.height,
+                        height: isLandscape ? previewSize.height : previewSize.width,
                         child: CameraPreview(_controller!),
                       ),
                     ),
@@ -617,26 +914,30 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
               ),
 
             // Corner bracket overlay.
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: _ViewfinderCorners(),
+            Padding(
+              padding: EdgeInsets.all(compact ? 8 : 16),
+              child: const _ViewfinderCorners(),
             ),
 
-            Positioned(
-              top: 10,
-              right: 14,
-              child: Text(
-                'Hands: $_handsVisible',
-                style: const TextStyle(color: Colors.black54, fontSize: 11, fontWeight: FontWeight.w600),
+            // In compact mode the card is only a couple of hundred px wide,
+            // so the hand counter would collide with the expand button.
+            if (!compact)
+              Positioned(
+                top: 10,
+                right: 14,
+                child: Text(
+                  'Hands: $_handsVisible',
+                  style: const TextStyle(color: Colors.black54, fontSize: 11, fontWeight: FontWeight.w600),
+                ),
               ),
-            ),
 
             // Debug status strip: makes the recognition pipeline's actual
-            // state visible (model load status, whether pose data is
-            // flowing, and whether a sign segment is currently being
-            // captured) instead of it silently doing nothing. Remove or
-            // hide behind a debug flag once things are confirmed working.
-            Positioned(
+            // state visible (model load status and whether a sign segment
+            // is currently being captured) instead of it silently doing
+            // nothing. Left in place intentionally -- keep for now.
+            // Too cramped to be readable on the compact card, so it's only
+            // drawn when the camera owns the large slot.
+            if (!compact) Positioned(
               left: 10,
               right: 10,
               bottom: 10,
@@ -668,12 +969,6 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
                         ),
                         const SizedBox(width: 8),
                         Icon(
-                          _latestPoseLandmarks != null ? Icons.accessibility_new : Icons.person_off,
-                          size: 12,
-                          color: _latestPoseLandmarks != null ? Colors.greenAccent : Colors.redAccent,
-                        ),
-                        const SizedBox(width: 8),
-                        Icon(
                           _gestureService.isCapturingSegment ? Icons.fiber_manual_record : Icons.pause_circle_outline,
                           size: 12,
                           color: _gestureService.isCapturingSegment ? Colors.redAccent : Colors.white54,
@@ -687,16 +982,6 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
                         ],
                       ],
                     ),
-                    if (_poseErrorMessage != null)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 3),
-                        child: Text(
-                          'Pose error: $_poseErrorMessage',
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: Colors.redAccent, fontSize: 9),
-                        ),
-                      ),
                     if (_lastSegmentDebug != null)
                       Padding(
                         padding: const EdgeInsets.only(top: 3),
@@ -717,7 +1002,7 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
     );
   }
 
-  Widget _buildAslBox() {
+  Widget _buildAslBox({bool compact = false}) {
     return Container(
       decoration: BoxDecoration(
         border: Border.all(color: _purple, width: 2),
@@ -727,17 +1012,68 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
       child: ClipRRect(
         borderRadius: BorderRadius.circular(14),
         child: _matchedWords.isEmpty
-            ? const Center(
+            ? Center(
           child: Text(
             '3D ASL',
-            style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 1),
+            style: TextStyle(
+              color: Colors.grey,
+              fontWeight: FontWeight.bold,
+              fontSize: compact ? 13 : 16,
+              letterSpacing: 1,
+            ),
           ),
         )
-            : SkeletalGestureViewer(
-          assetPath: _currentWord?.landmarksAsset,
-          sequenceKey: _currentWordIndex,
-          onFinished: _advanceToNextWord,
+            : Stack(
+          children: [
+            AvatarGestureViewer(
+              key: ValueKey(_avatar.assetPath),
+              modelAsset: _avatar.assetPath,
+              animationName: _currentWord?.signAnimation,
+              durationMs: _currentWord?.signDurationMs,
+              sequenceKey: _currentWordIndex,
+              onFinished: _advanceToNextWord,
+            ),
+            if (_currentWord != null && _currentWord!.isFingerspelled)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 8,
+                child: Center(
+                  child: _buildSpellingCaption(_currentWord!, compact: compact),
+                ),
+              ),
+          ],
         ),
+      ),
+    );
+  }
+
+  /// Shows the word being fingerspelled with the current letter
+  /// highlighted, e.g.  H E [L] L O
+  Widget _buildSpellingCaption(ASLWord w, {bool compact = false}) {
+    final letters = (w.spellingOf ?? w.word).toUpperCase().split('');
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 12, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var i = 0; i < letters.length; i++)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 2),
+              child: Text(
+                letters[i],
+                style: TextStyle(
+                  fontSize: compact ? 13 : 18,
+                  fontWeight: FontWeight.bold,
+                  color: i == w.letterIndex ? Colors.amberAccent : Colors.white54,
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -803,45 +1139,26 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-            child: _isTranscribing
-                ? const CircularProgressIndicator(color: Colors.white)
-                : _isRecording
-                ? ElevatedButton.icon(
-              onPressed: _stopListening,
-              icon: const Icon(Icons.stop),
-              label: const Text('Stop'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.red.shade400,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-              ),
-            )
-                : ElevatedButton.icon(
-              onPressed: _startListening,
-              icon: const Icon(Icons.mic),
-              label: const Text('Start Speaking'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.white,
-                foregroundColor: _purple,
-                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-              ),
-            ),
+            child: _buildMicControl(),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildChatBubble(_ConversationEntry entry) {
+  /// [maxWidth] lets the landscape drawer cap bubbles to its own width --
+  /// the screen-width default is far too wide once the panel is docked
+  /// to the side.
+  Widget _buildChatBubble(_ConversationEntry entry, {double? maxWidth}) {
     final isSigned = entry.source == _EntrySource.signed;
     return Align(
       alignment: isSigned ? Alignment.centerLeft : Alignment.centerRight,
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.65),
+        constraints: BoxConstraints(
+          maxWidth: maxWidth ?? MediaQuery.of(context).size.width * 0.65,
+        ),
         decoration: BoxDecoration(
           color: isSigned ? Colors.white.withOpacity(0.15) : Colors.white,
           borderRadius: BorderRadius.circular(14),
@@ -879,7 +1196,6 @@ class _LiveConversationScreenState extends State<LiveConversationScreen> {
     _controller?.stopImageStream();
     _controller?.dispose();
     _plugin?.dispose();
-    _poseDetector?.close();
     _gestureService.dispose();
     _tts.dispose();
     super.dispose();

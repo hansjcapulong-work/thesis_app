@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../widgets/app_bottom_nav.dart';
+import '../utils/slide_page_route.dart';
 import 'progress_screen.dart';
 import 'settings_screen.dart';
 
@@ -19,9 +20,16 @@ class NotificationsScreen extends StatelessWidget {
       bottomNavigationBar: AppBottomNav(
         currentIndex: 2,
         onTap: (i) {
-          if (i == 0) Navigator.pop(context);
-          if (i == 1) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const ProgressScreen()));
-          if (i == 3) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const SettingsScreen()));
+          if (i == 2) return;
+          if (i == 0) {
+            Navigator.pop(context);
+            return;
+          }
+          final Widget target = i == 1 ? const ProgressScreen() : const SettingsScreen();
+          Navigator.pushReplacement(
+            context,
+            slideToTabRoute(page: target, fromIndex: 2, toIndex: i),
+          );
         },
       ),
     );
